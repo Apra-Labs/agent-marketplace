@@ -1,0 +1,10 @@
+{
+  "name": "apra-agent-marketplace",
+  "private": true,
+  "description": "Dev tooling for the plugins in this repo. Never put a package.json + lockfile inside a plugin folder: Claude Code would npm-install it on every user's machine.",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "test": "node --test \"plugins/*/tests/**/*.test.mjs\""
+  }
+}

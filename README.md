@@ -9,7 +9,9 @@ Claude Code plugins from [Apra Labs](https://apralabs.com): skills, agents, hook
 /plugin install <plugin>@apra
 ```
 
-Update with `/plugin marketplace update apra`. Plugins that need other plugins (for example the apra-fleet MCP) install them automatically.
+Update with `/plugin marketplace update apra`.
+
+Some plugins need [apra-fleet](https://github.com/Apra-Labs/apra-fleet) (see **Needs** below). It is not installed from here: install it with its own installer ([instructions](https://github.com/Apra-Labs/apra-fleet/blob/main/docs/install.md)), which also brings fleet's own skills (`/fleet`, `/pm`, ...). Those plugins check the apra-fleet version when they run and tell you if it is missing or too old.
 
 ## Plugins
 
@@ -20,4 +22,8 @@ Update with `/plugin marketplace update apra`. Plugins that need other plugins (
 
 ## Other agents
 
-Skills follow the open [Agent Skills](https://agentskills.io) format, so the `SKILL.md` folders under `plugins/*/skills/` also work in Gemini CLI, OpenCode and other compatible agents. Copy the skill folder into that agent's skills directory. Plugin dependencies and MCP setup are not automatic outside Claude Code.
+Skills follow the open [Agent Skills](https://agentskills.io) format, so the `SKILL.md` folders under `plugins/*/skills/` also work in Gemini CLI, OpenCode and other compatible agents. Copy the skill folder into that agent's skills directory. Plugin dependencies are not automatic outside Claude Code.
+
+## Contributing
+
+Each plugin's source lives in its folder here (tests in `plugins/<name>/tests/`; run `npm test` from the root). bitbucket-devops is the exception: its source is [bitbucket-devops-skill](https://github.com/Apra-Labs/bitbucket-devops-skill), pulled in by `scripts/sync-bitbucket-devops.ps1`. See [CLAUDE.md](CLAUDE.md) for the rules.

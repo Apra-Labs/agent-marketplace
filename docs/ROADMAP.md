@@ -2,9 +2,8 @@
 
 Order matters: each step proves something the next one relies on.
 
-1. **bitbucket-devops** (task 001) — no dependencies. Proves packaging, paths, bundled code, Windows install, tagging.
-2. **apra-fleet base plugin** — lives in the apra-fleet repo (it already has `skills/fleet` and `plugins/claude-code/fleet-status`). Give it a root `.claude-plugin/plugin.json` whose MCP config starts the fleet server, so installing the plugin registers the MCP. List it here with a `github` source; tags `apra-fleet--v<version>` go on the apra-fleet repo. Decide whether fleet-status merges into it or stays a separate plugin that depends on it.
-3. **First plugin that depends on apra-fleet** — declares `"dependencies": [{ "name": "apra-fleet", "version": "^<major>.<minor>" }]`. Proves that installing it pulls in apra-fleet and the MCP.
-4. **Inventory and migrate the rest.** For each scattered skill: does it assume the fleet MCP, which other skills does it call, is it public-safe. Skills always used together share a plugin; shared ones get their own plugin and are depended on.
-5. **Bundle plugin** (e.g. `apra-dev-standard`): only a `dependencies` list. One install for a new developer; push it org-wide via `enabledPlugins` in managed settings.
-6. **Automate sync** once there are two or three plugins with source repos: a GitHub Action per source repo that runs the build and opens a PR here.
+1. **bitbucket-devops** (task 001) — done. Proved packaging, paths, bundled code, Windows install. Its source stays in its own repo (build step, submodule, `install.sh` users).
+2. **rport** — done. First plugin whose source lives here, and first that needs apra-fleet: states the minimum version and checks it at runtime (CLAUDE.md rule 4). apra-fleet itself is not delivered from this marketplace; `apra-fleet install` stays its installer.
+3. **Inventory and consolidate the rest.** For each scattered skill: is it public-safe (no client/site names, hosts, credentials), does it need apra-fleet (which version), which other skills does it call. Public-safe ones move into `plugins/<name>/` with their tests; skills always used together share a plugin. Client- or site-specific ones need a separate private marketplace.
+4. **Bundle plugin** (e.g. `apra-dev-standard`): only a `dependencies` list. One install for a new developer; push it org-wide via `enabledPlugins` in managed settings.
+5. **Automate checks:** CI on this repo runs `npm test` and `claude plugin validate` for every changed plugin, and checks that fleet-dependent plugins carry the version gate.
