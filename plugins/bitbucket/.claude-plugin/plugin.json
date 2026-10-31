@@ -1,0 +1,20 @@
+{
+  "name": "bitbucket",
+  "version": "1.0.0",
+  "description": "Bitbucket Cloud done right: REST and git authentication (API tokens with scopes, access tokens), repos, code, pull requests and reviews, pipelines and logs, deployments. The token stays in apra-fleet. Requires apra-fleet 0.4.4+ and Node.js 18+.",
+  "author": {
+    "name": "Apra Labs",
+    "url": "https://apralabs.com"
+  },
+  "homepage": "https://github.com/Apra-Labs/agent-marketplace/tree/main/plugins/bitbucket",
+  "license": "Apache-2.0",
+  "keywords": [
+    "bitbucket",
+    "git",
+    "pull-requests",
+    "pipelines",
+    "deployments",
+    "api-tokens",
+    "apra-fleet"
+  ]
+}

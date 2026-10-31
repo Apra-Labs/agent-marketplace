@@ -5,8 +5,8 @@ on the runner member, token only as `{{secret.NAME}}`), servers and monikers, an
 
 In this chapter `RUN <args>` is shorthand for the runner-shell command:
 
-- Git Bash / POSIX: `RPORT_TOKEN='{{secret.RPORT_API_TOKEN}}' node "<skill>/scripts/rport.mjs" <args>`
-- PowerShell: `$env:RPORT_TOKEN='{{secret.RPORT_API_TOKEN}}'; node "<skill>\scripts\rport.mjs" <args>`
+- Git Bash / POSIX: `RPORT_TOKEN={{secret.RPORT_API_TOKEN}} node "<skill>/scripts/rport.mjs" <args>`
+- PowerShell: `$env:RPORT_TOKEN={{secret.RPORT_API_TOKEN}}; node "<skill>\scripts\rport.mjs" <args>`
 
 Use the server's `token_secret` instead of `RPORT_API_TOKEN`, and add `--server <moniker>` when more
 than one server is configured and the one you want is not `default`.
@@ -192,18 +192,18 @@ secret `RPORT_API_TOKEN` scoped to `my-runner`.
    and `node "<skill>/scripts/rport.mjs" runner set my-runner`.
 2. Once, **operator-approved admin change**: create the stored tunnel. Dry run, show it, then run:
    ```
-   RPORT_TOKEN='{{secret.RPORT_API_TOKEN}}' node "<skill>/scripts/rport.mjs" def add my-ssh --client my-server --remote 22 --scheme ssh --acl self --idle 60 --auto-close 8h --dry-run
-   RPORT_TOKEN='{{secret.RPORT_API_TOKEN}}' node "<skill>/scripts/rport.mjs" def add my-ssh --client my-server --remote 22 --scheme ssh --acl self --idle 60 --auto-close 8h
+   RPORT_TOKEN={{secret.RPORT_API_TOKEN}} node "<skill>/scripts/rport.mjs" def add my-ssh --client my-server --remote 22 --scheme ssh --acl self --idle 60 --auto-close 8h --dry-run
+   RPORT_TOKEN={{secret.RPORT_API_TOKEN}} node "<skill>/scripts/rport.mjs" def add my-ssh --client my-server --remote 22 --scheme ssh --acl self --idle 60 --auto-close 8h
    ```
    Idle 60 because the agent uses SSH intermittently; 8h covers a working day.
 3. Once, local: `RUN link add my-ssh --client my-server --fleet-member my-member`.
 4. Each time it is needed, via `mcp__apra-fleet__execute_command` on `my-runner`:
    ```
-   RPORT_TOKEN='{{secret.RPORT_API_TOKEN}}' node "<skill>/scripts/rport.mjs" revive my-ssh --client my-server
+   RPORT_TOKEN={{secret.RPORT_API_TOKEN}} node "<skill>/scripts/rport.mjs" revive my-ssh --client my-server
    ```
    PowerShell runner:
    ```
-   $env:RPORT_TOKEN='{{secret.RPORT_API_TOKEN}}'; node "<skill>\scripts\rport.mjs" revive my-ssh --client my-server
+   $env:RPORT_TOKEN={{secret.RPORT_API_TOKEN}}; node "<skill>\scripts\rport.mjs" revive my-ssh --client my-server
    ```
 5. Read `RESULT`. With `port_changed: true`: `mcp__apra-fleet__update_member` with
    `member_name: "my-member"`, `port: <RESULT.port>`, `fleet_install: "skip"`; then

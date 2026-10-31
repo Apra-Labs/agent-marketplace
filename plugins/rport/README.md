@@ -44,7 +44,7 @@ Run these through your agent; it uses apra-fleet for anything that needs the tok
    node <skill>/scripts/rport.mjs runner set my-runner
    ```
    No moniker means `default`; with one server, `--server` is never needed.
-3. Check access: `RPORT_TOKEN='{{secret.RPORT_API_TOKEN}}' node <skill>/scripts/rport.mjs whoami`.
+3. Check access: `RPORT_TOKEN={{secret.RPORT_API_TOKEN}} node <skill>/scripts/rport.mjs whoami`.
 4. Ask the agent to "create an SSH tunnel definition for my-server" (an admin change it does only
    on your request, after a dry run), then to "revive my-ssh" whenever you need it.
 
