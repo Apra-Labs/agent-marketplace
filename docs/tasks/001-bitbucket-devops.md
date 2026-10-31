@@ -1,6 +1,6 @@
 # Task 001 — Publish bitbucket-devops as the first plugin
 
-**Status:** in review - release (step 6) waiting for approval
+**Status:** merged - release tags pending (source `v1.3.0`, marketplace `bitbucket-devops--v1.3.0`)
 **Source repo:** https://github.com/Apra-Labs/bitbucket-devops-skill (default branch; includes the `bitbucket-mcp` submodule, branch `apralabs-develop`)
 **Result:** `bitbucket-devops@apra` installs with `/plugin install` on Windows and Linux, and its helpers work from the installed location.
 
@@ -97,4 +97,4 @@ Checked against https://code.claude.com/docs/en/ (skills, plugins/manifest-refer
 
 **Install route regression** (source repo git checkout, no `bin/`): `helpers.js` falls back to `bitbucket-mcp/dist/index-cli.js`; `check-for-updates` still reports `git-checkout`.
 
-**Release (step 6) pending:** after #7 merges, tag the source repo `v1.3.0`, re-run `scripts/sync-bitbucket-devops.ps1` with no ref (picks up the tag), merge this branch, then `claude plugin tag --push` from `plugins/bitbucket-devops`.
+**Release (step 6) pending:** #7 merged and #8 (Apache-2.0 relicense + third-party notices) merged; plugin re-synced from source main f8dcaf2; tag the source repo `v1.3.0`, re-run `scripts/sync-bitbucket-devops.ps1` with no ref (picks up the tag), merge this branch, then `claude plugin tag --push` from `plugins/bitbucket-devops`.

@@ -8,7 +8,7 @@
   },
   "homepage": "https://github.com/Apra-Labs/bitbucket-devops-skill",
   "repository": "https://github.com/Apra-Labs/bitbucket-devops-skill",
-  "license": "CC-BY-4.0",
+  "license": "Apache-2.0",
   "keywords": [
     "bitbucket",
     "devops",
