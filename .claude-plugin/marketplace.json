@@ -22,6 +22,20 @@
         "pull-requests",
         "deployments"
       ]
+    },
+    {
+      "name": "rport",
+      "source": "./plugins/rport",
+      "description": "Guardrails for RPort servers (rportd/openrport): stored tunnels, revive, expiry, repointing fleet members; the API token stays in apra-fleet. Requires apra-fleet 0.4.5+ and Node.js 18+.",
+      "version": "0.2.0",
+      "category": "devops",
+      "keywords": [
+        "rport",
+        "openrport",
+        "tunnels",
+        "remote-access",
+        "apra-fleet"
+      ]
     }
   ]
 }
