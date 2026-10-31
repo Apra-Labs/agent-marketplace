@@ -1,6 +1,6 @@
 # Task 001 — Publish bitbucket-devops as the first plugin
 
-**Status:** merged - release tags pending (source `v1.3.0`, marketplace `bitbucket-devops--v1.3.0`)
+**Status:** done, then superseded: bitbucket-devops was replaced by the `bitbucket` plugin (see CHANGELOG) before any release tag; the source repo was left as is.
 **Source repo:** https://github.com/Apra-Labs/bitbucket-devops-skill (default branch; includes the `bitbucket-mcp` submodule, branch `apralabs-develop`)
 **Result:** `bitbucket-devops@apra` installs with `/plugin install` on Windows and Linux, and its helpers work from the installed location.
 

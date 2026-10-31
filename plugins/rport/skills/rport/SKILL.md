@@ -53,6 +53,9 @@ so the agent never sees or handles the token. Therefore:
    variable in that one command only.
 3. The script reads `RPORT_TOKEN`, never prints it, never puts it in a URL, log, error or the ledger,
    and redacts `Authorization` in `--debug` output.
+4. apra-fleet substitutes `{{secret.NAME}}` **already quoted** for the runner's shell. Write it
+   bare, as in the templates below - never inside your own quotes, or the token arrives corrupted
+   and the server answers 401.
 
 Command templates (`<NAME>` = the server's `token_secret`, default `RPORT_API_TOKEN`; `<skill>` = this
 skill's folder, `${CLAUDE_SKILL_DIR}`, here and in `chapters/`; forward slashes work in PowerShell
@@ -64,11 +67,11 @@ Linux. Only the way the environment variable is set differs by shell.
 
 Git Bash on Windows, or bash/zsh/sh on macOS and Linux:
 ```
-RPORT_TOKEN='{{secret.<NAME>}}' node "<skill>/scripts/rport.mjs" <command> [args]
+RPORT_TOKEN={{secret.<NAME>}} node "<skill>/scripts/rport.mjs" <command> [args]
 ```
 PowerShell:
 ```
-$env:RPORT_TOKEN='{{secret.<NAME>}}'; node "<skill>\scripts\rport.mjs" <command> [args]
+$env:RPORT_TOKEN={{secret.<NAME>}}; node "<skill>\scripts\rport.mjs" <command> [args]
 ```
 Commands that touch only local config (`server`, `runner`, `link list`, `ledger`) need no token; run
 them without the `RPORT_TOKEN` part. If the runner member is on another machine than the skill, copy

@@ -17,7 +17,7 @@ Some plugins need [apra-fleet](https://github.com/Apra-Labs/apra-fleet) (see **N
 
 | Plugin | What it does | Needs |
 |---|---|---|
-| [bitbucket-devops](plugins/bitbucket-devops) | Bitbucket Cloud pipelines, pull requests and deployments: check status, analyse failures, download logs, trigger builds. Source: [bitbucket-devops-skill](https://github.com/Apra-Labs/bitbucket-devops-skill) | Node.js 18+, Bitbucket credentials in `~/.bitbucket-credentials` |
+| [bitbucket](plugins/bitbucket) | Bitbucket Cloud done right: REST and git authentication (API tokens with scopes, access tokens), repos and code, pull requests and reviews, pipelines and logs, deployments. The token never reaches the agent. | apra-fleet 0.4.4+ (MCP, with a local member), Node.js 18+, a Bitbucket API token with scopes or an access token |
 | [rport](plugins/rport) | Safe RPort (rportd/openrport) work: stored tunnels, revive, expiry bookkeeping, repointing apra-fleet members when a port changes. The API token never reaches the agent. | apra-fleet 0.4.4+ (MCP, with a local member), Node.js 18+ |
 
 ## Other agents
@@ -26,4 +26,4 @@ Skills follow the open [Agent Skills](https://agentskills.io) format, so the `SK
 
 ## Contributing
 
-Each plugin's source lives in its folder here (tests in `plugins/<name>/tests/`; run `npm test` from the root). bitbucket-devops is the exception: its source is [bitbucket-devops-skill](https://github.com/Apra-Labs/bitbucket-devops-skill), pulled in by `scripts/sync-bitbucket-devops.ps1`. See [CLAUDE.md](CLAUDE.md) for the rules.
+Each plugin's source lives in its folder here (tests in `plugins/<name>/tests/`; run `npm test` from the root). A plugin gets its own source repo only for a concrete reason (see CLAUDE.md rule 1); none does today. See [CLAUDE.md](CLAUDE.md) for the rules.

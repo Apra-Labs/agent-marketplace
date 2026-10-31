@@ -423,7 +423,7 @@ function connFor(cfg, moniker) {
 function readToken(conn) {
   const t = process.env.RPORT_TOKEN;
   if (!t) {
-    throw cfgErr(`RPORT_TOKEN is not set. Run this script through mcp__apra-fleet__execute_command on the runner member with RPORT_TOKEN='{{secret.${conn.token_secret}}}' in the same command.`);
+    throw cfgErr(`RPORT_TOKEN is not set. Run this script through mcp__apra-fleet__execute_command on the runner member with RPORT_TOKEN={{secret.${conn.token_secret}}} (bare: apra-fleet substitutes it already quoted) in the same command.`);
   }
   if (/\{\{\s*secret\./.test(t)) {
     throw cfgErr(`RPORT_TOKEN still holds an unsubstituted {{secret.…}} placeholder. Check the secret name (${conn.token_secret}), that its "members" scope includes this runner member, and that its network_policy is allow or confirm.`);
@@ -1055,7 +1055,7 @@ export const HELP = `rport.mjs - RPort helper for the rport agent skill (Node >=
 
 Run it through mcp__apra-fleet__execute_command on the runner member (a local
 apra-fleet member), with the API token in RPORT_TOKEN for that one command only:
-  RPORT_TOKEN='{{secret.RPORT_API_TOKEN}}' node <skill>/scripts/rport.mjs <command> ...
+  RPORT_TOKEN={{secret.RPORT_API_TOKEN}} node <skill>/scripts/rport.mjs <command> ...
 
 A tunnel definition is an RPort stored tunnel (per server, per client, by name).
 A live tunnel is an instance of it. Locally: servers, runner, links, a ledger.

@@ -1,0 +1,6 @@
+{
+  "credential_type": "api_token",
+  "email": "you@example.com",
+  "username": "your-bitbucket-username",
+  "workspace": "your-workspace"
+}
