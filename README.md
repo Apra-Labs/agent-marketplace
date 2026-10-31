@@ -16,6 +16,7 @@ Update with `/plugin marketplace update apra`. Plugins that need other plugins (
 | Plugin | What it does | Needs |
 |---|---|---|
 | [bitbucket-devops](plugins/bitbucket-devops) | Bitbucket Cloud pipelines, pull requests and deployments: check status, analyse failures, download logs, trigger builds. Source: [bitbucket-devops-skill](https://github.com/Apra-Labs/bitbucket-devops-skill) | Node.js 18+, Bitbucket credentials in `~/.bitbucket-credentials` |
+| [rport](plugins/rport) | Safe RPort (rportd/openrport) work: stored tunnels, revive, expiry bookkeeping, repointing apra-fleet members when a port changes. The API token never reaches the agent. | apra-fleet 0.4.5+ (MCP, with a local member), Node.js 18+ |
 
 ## Other agents
 

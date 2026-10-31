@@ -1,0 +1,19 @@
+{
+  "runner_member": "my-runner",
+  "servers": {
+    "default": {
+      "url": "https://rport.example.com",
+      "user": "alice",
+      "token_secret": "RPORT_API_TOKEN"
+    },
+    "lab": {
+      "url": "https://203.0.113.10",
+      "user": "alice",
+      "token_secret": "RPORT_LAB_TOKEN",
+      "runner_member": "lab-runner"
+    }
+  },
+  "links": [
+    { "server": "default", "client_id": "<client id>", "client": "my-server", "name": "my-ssh", "fleet_member": "my-member" }
+  ]
+}
