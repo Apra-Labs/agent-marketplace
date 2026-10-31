@@ -1,6 +1,6 @@
 # Task 001 — Publish bitbucket-devops as the first plugin
 
-**Status:** open
+**Status:** in review - release (step 6) waiting for approval
 **Source repo:** https://github.com/Apra-Labs/bitbucket-devops-skill (default branch; includes the `bitbucket-mcp` submodule, branch `apralabs-develop`)
 **Result:** `bitbucket-devops@apra` installs with `/plugin install` on Windows and Linux, and its helpers work from the installed location.
 
@@ -79,4 +79,22 @@ Checked against https://code.claude.com/docs/en/ (skills, plugins/manifest-refer
 4. Other facts used: `plugin.json` and the marketplace entry may both carry `version` (validate warns only if they differ; plugin.json wins). `claude plugin tag` creates `<name>--v<version>` and refuses if the two disagree or the tree is dirty. A marketplace added from a local directory loads plugins in place (no cache copy), so verification installs from a `file://` git URL of this repo to exercise the real cache path.
 
 ## Verification
-_(fill in at step 5)_
+2026-10-31, Claude Code 2.1.314. Plugin built by `scripts/sync-bitbucket-devops.ps1 -Ref feat/plugin-build` (source PR Apra-Labs/bitbucket-devops-skill#7; no release tag exists yet). Real workspace/repo names replaced with `<workspace>/<repo>`.
+
+**Windows 11 (PowerShell + Git Bash, Node 22)**
+1. `claude plugin validate .` -> passed (advice only: README could show the one-step `--marketplace` install line). `claude plugin validate plugins/bitbucket-devops` -> passed (warning: no icon).
+2. Fresh profile: `CLAUDE_CONFIG_DIR=<empty dir>`, `claude plugin marketplace add "https://github.com/Apra-Labs/agent-marketplace.git#feat/bitbucket-devops-plugin"` (a local path loads in place and `file://` URLs are rejected by this CLI, so a git ref was used to exercise the real cache copy), `claude plugin install bitbucket-devops@apra` -> installed 1.3.0, enabled, at `<config>/plugins/cache/apra/bitbucket-devops/1.3.0/`.
+3. Session: `claude -p "... check credentials for Bitbucket ..." --plugin-dir <installed cache dir>` -> the agent ran `node "C:/Users/<user>/.../cache/apra/bitbucket-devops/1.3.0/skills/bitbucket-devops/lib/helpers.js" check-credentials` (`${CLAUDE_SKILL_DIR}` substituted with forward slashes) and reported `~/.bitbucket-credentials` active, tier1Ready/tier2Ready true. Note: a fresh profile has no Claude login, so the session ran in the normal profile; there a leftover `~/.claude/skills/bitbucket-devops` install wins when the prompt does not name the skill (it is listed as `bitbucket-devops`, the plugin as `bitbucket-devops:bitbucket-devops`). Users who installed the old way should delete `~/.claude/skills/bitbucket-devops` after installing the plugin.
+4. Same session, real credentials: latest failed pipeline for `<workspace>/<repo>` -> build #108 FAILED via `helpers.js get-latest-failed`; Tier 2 `node ".../bin/bitbucket-cli.mjs" list-pipelines <workspace> <repo> 3` -> 3 pipelines. Directly from the cache dir: `bin/bitbucket-cli.mjs list-repos <workspace> 50` -> exit 0.
+5. `node <cache>/lib/helpers.js self-update` and `check-for-updates` -> `Installed as a Claude Code plugin - update with /plugin marketplace update apra`, exit 0.
+6. `grep -rn "\.claude/skills" plugins/bitbucket-devops` and the installed cache -> no matches (exit 1). `npm run build:plugin` also fails the build if any remain.
+
+**Linux (Debian bookworm container `node:22-bookworm`, Claude Code 2.1.314, fresh home, no credentials)**
+- `claude plugin marketplace add <same URL#ref>` + `claude plugin install bitbucket-devops@apra` -> installed 1.3.0 at `/root/.claude/plugins/cache/apra/bitbucket-devops/1.3.0/`.
+- grep `.claude/skills` in the cache -> none. `self-update` -> plugin message, exit 0. `check-credentials` -> "No credentials file found", exit 0. Bundled CLI loads with no `node_modules` (fails only on missing credentials, as expected). Live API calls were not run on Linux, to avoid copying credentials off the Windows machine.
+
+**Node 18** (`node:18-bookworm-slim`, v18.20.8): `helpers.js self-update`, `check-credentials` and `bin/bitbucket-cli.mjs` all load and run from the plugin folder.
+
+**Install route regression** (source repo git checkout, no `bin/`): `helpers.js` falls back to `bitbucket-mcp/dist/index-cli.js`; `check-for-updates` still reports `git-checkout`.
+
+**Release (step 6) pending:** after #7 merges, tag the source repo `v1.3.0`, re-run `scripts/sync-bitbucket-devops.ps1` with no ref (picks up the tag), merge this branch, then `claude plugin tag --push` from `plugins/bitbucket-devops`.
