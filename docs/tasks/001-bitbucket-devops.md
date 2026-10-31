@@ -71,7 +71,12 @@ Commit, push, then from `plugins/bitbucket-devops`: `claude plugin tag --push`. 
 - CI automation of the sync script — do it by hand for this first plugin; automate once there are two or three plugins.
 
 ## Findings
-_(fill in at step 1)_
+Checked against https://code.claude.com/docs/en/ (skills, plugins/manifest-reference, plugins/loading, plugins/marketplace-reference, plugins/cli-reference) on 2026-10-31, Claude Code 2.1.314.
+
+1. **Skill directory variable: `${CLAUDE_SKILL_DIR}`.** "The directory containing the skill's `SKILL.md` file. For plugin skills, this is the skill's subdirectory within the plugin, not the plugin root." It is substituted in the SKILL.md body and in `allowed-tools` Bash rules, so for an installed plugin it resolves to `.../plugins/cache/apra/bitbucket-devops/<version>/skills/bitbucket-devops`. On Windows substituted paths use forward slashes (`C:/Users/...`), which works from both PowerShell and Git Bash. It is NOT substituted in files the agent reads later (docs/*.md) and NOT exported to Bash-tool commands; so docs/ in the plugin refer to `${CLAUDE_SKILL_DIR}` and SKILL.md (where it is substituted) tells the agent what that path is. `${CLAUDE_PLUGIN_ROOT}` is also substituted in plugin skill bodies, but it is the plugin root, so `${CLAUDE_SKILL_DIR}` is the right one here.
+2. **Plugin Node package dependencies exist** ("Node.js package dependencies", plugins/loading): if the plugin root has `package.json` + a lockfile, Claude Code runs that package manager from the user's PATH when it copies the plugin into the cache and moves `node_modules` into the cached copy. Caveats: needs npm on PATH, 60 s timeout, `--ignore-scripts`, registry deps only, cannot be turned off, a failed or skipped install leaves the plugin loaded but broken (only a note in `/plugin`), and it does not run at all for a plugin loaded in place from a local-path marketplace. **Decision: bundle** the CLI into one self-contained `bin/bitbucket-cli.mjs` (esbuild, all deps inlined, ~450 KB). Nothing to install or build on the user's machine and no npm-on-PATH or timeout failure mode. A trial bundle of `bitbucket-mcp/src/index-cli.ts` ran with no `node_modules` present.
+3. Node requirement: `bitbucket-mcp` declares `engines.node >=18`; the bundle targets node18.
+4. Other facts used: `plugin.json` and the marketplace entry may both carry `version` (validate warns only if they differ; plugin.json wins). `claude plugin tag` creates `<name>--v<version>` and refuses if the two disagree or the tree is dirty. A marketplace added from a local directory loads plugins in place (no cache copy), so verification installs from a `file://` git URL of this repo to exercise the real cache path.
 
 ## Verification
 _(fill in at step 5)_
