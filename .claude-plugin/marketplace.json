@@ -1,0 +1,11 @@
+{
+  "name": "apra",
+  "owner": {
+    "name": "Apra Labs",
+    "email": "contact@apralabs.com"
+  },
+  "metadata": {
+    "description": "Apra Labs skills, agents, hooks and MCP servers for Claude Code"
+  },
+  "plugins": []
+}
