@@ -1,7 +1,7 @@
 {
   "name": "rport",
   "version": "0.2.0",
-  "description": "Guardrails for RPort servers (rportd/openrport): stored tunnels, revive, expiry, repointing fleet members; the API token stays in apra-fleet. Requires apra-fleet 0.4.5+ and Node.js 18+.",
+  "description": "Guardrails for RPort servers (rportd/openrport): stored tunnels, revive, expiry, repointing fleet members; the API token stays in apra-fleet. Requires apra-fleet 0.4.4+ and Node.js 18+.",
   "author": {
     "name": "Apra Labs",
     "url": "https://apralabs.com"
