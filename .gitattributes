@@ -1,0 +1,4 @@
+# Plugins run on Windows, Linux and macOS: keep LF in the repo and on checkout,
+# except PowerShell scripts.
+* text=auto eol=lf
+*.ps1 text eol=crlf

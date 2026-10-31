@@ -15,7 +15,7 @@ Update with `/plugin marketplace update apra`. Plugins that need other plugins (
 
 | Plugin | What it does | Needs |
 |---|---|---|
-| _none yet_ | | |
+| [bitbucket-devops](plugins/bitbucket-devops) | Bitbucket Cloud pipelines, pull requests and deployments: check status, analyse failures, download logs, trigger builds. Source: [bitbucket-devops-skill](https://github.com/Apra-Labs/bitbucket-devops-skill) | Node.js 18+, Bitbucket credentials in `~/.bitbucket-credentials` |
 
 ## Other agents
 
