@@ -38,8 +38,8 @@ CLI already offers (`clients`, `whoami`) is fine.
 
 **Requires apra-fleet 0.4.4 or later.** Before the first RPort action in a session, call
 `mcp__apra-fleet__version` (it returns e.g. `apra-fleet v0.4.4_<build>`). If the tool is missing or
-the version is below 0.4.4, stop: tell the operator to install or upgrade apra-fleet to 0.4.4+ and
-do not try a workaround.
+the version is below 0.4.4, stop: tell the operator to install or upgrade apra-fleet to 0.4.4+
+(https://github.com/Apra-Labs/apra-fleet/blob/main/docs/install.md) and do not try a workaround.
 
 The operator gives this skill **one secret per server: their RPort API token**, kept in the
 apra-fleet credential store. URL, username and moniker are not secret; they live in the config.
