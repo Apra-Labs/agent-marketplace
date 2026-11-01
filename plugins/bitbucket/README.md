@@ -38,7 +38,8 @@ Other agent hosts: copy `skills/bitbucket/` into that host's skills folder.
 Ask your agent; it handles the commands.
 
 1. Store the token in apra-fleet, collected out of band (never paste it in chat):
-   `credential_store_set name=BITBUCKET_API_TOKEN members=<your local member> network_policy=confirm`
+   `credential_store_set name=BITBUCKET_API_TOKEN members=<your local member> network_policy=confirm persist=true`
+   (any name works; if you pick another, the agent records it with `config set --token-secret <NAME>`)
 2. "Set up Bitbucket for workspace `<workspace>` with my email `<atlassian email>`" ->
    `config set --type api_token --email ... --workspace ...` (non-secret, `~/.config/bitbucket-skill/`).
 3. "Test my Bitbucket access on `<workspace>/<repo>`" -> `auth test` checks REST and git and

@@ -74,13 +74,15 @@ API tokens must have an expiry (max 1 year). Note it; an expired token is a plai
      with scopes** -> app **Bitbucket** -> the scopes above.
    - Access token: repository/project/workspace **Settings -> Access tokens**.
 2. Store it in apra-fleet, collected out of band and scoped to the local runner member:
-   `credential_store_set name=BITBUCKET_API_TOKEN members=<runner> network_policy=confirm`.
-   Use `allow` instead of `confirm` only if the user wants no confirmation per call.
+   `credential_store_set name=BITBUCKET_API_TOKEN members=<runner> network_policy=confirm persist=true`.
+   Any name works; `BITBUCKET_API_TOKEN` is the default the script assumes. Use `allow` instead of
+   `confirm` only if the user wants no confirmation per call.
 3. Save the non-secret settings (local, no token needed):
    ```
    node "${CLAUDE_SKILL_DIR}/scripts/bitbucket.mjs" config set --type api_token --email <atlassian email> --workspace <workspace>
    ```
-   For an access token: `--type access_token` (no email).
+   For an access token: `--type access_token` (no email). If the secret has another name, add
+   `--token-secret <NAME>`; `config show` then prints the exact `runner_env` to use.
 4. Test both channels (see SKILL.md for the exact runner command):
    `auth test <workspace>/<repo>` -> REST check + `git ls-remote`, with a diagnosis if either fails.
 

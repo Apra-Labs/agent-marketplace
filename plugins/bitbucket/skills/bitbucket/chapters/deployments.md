@@ -27,9 +27,9 @@ bb deploy var-delete <repo> <env> <KEY|uuid> --dry-run
 value as its own apra-fleet secret first (`credential_store_set name=<NAME> ...`, collected out of
 band), and you pass it through the environment in the same runner command:
 ```
-MY_VALUE={{secret.<NAME>}} BITBUCKET_TOKEN={{secret.BITBUCKET_API_TOKEN}} node "${CLAUDE_SKILL_DIR}/scripts/bitbucket.mjs" deploy var-set <repo> <env> <KEY> --value-env MY_VALUE
+MY_VALUE={{secret.<NAME>}} BITBUCKET_TOKEN={{secret.<SECRET>}} node "${CLAUDE_SKILL_DIR}/scripts/bitbucket.mjs" deploy var-set <repo> <env> <KEY> --value-env MY_VALUE
 ```
-(PowerShell: `$env:MY_VALUE={{secret.<NAME>}}; $env:BITBUCKET_TOKEN={{secret.BITBUCKET_API_TOKEN}}; node ...`.)
+(PowerShell: `$env:MY_VALUE={{secret.<NAME>}}; $env:BITBUCKET_TOKEN={{secret.<SECRET>}}; node ...`.)
 The script refuses `--value` together with `--secured`, and redacts values from all output.
 
 Deleting a deployment environment is not offered: it removes its deployment history. If the user

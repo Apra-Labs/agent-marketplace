@@ -32,9 +32,15 @@ and do not try a workaround.
 ## How to call Bitbucket: always through the script, via apra-fleet
 
 The user keeps **one secret: their Bitbucket token** (an API token with scopes, or a repository/
-project/workspace access token) in the apra-fleet credential store, default name
-`BITBUCKET_API_TOKEN`. Email, workspace and credential type are not secret; they live in the
-script's config (`~/.config/bitbucket-skill/config.json`, set with `config set`).
+project/workspace access token) in the apra-fleet credential store, under any name. Email,
+workspace, credential type and the secret's **name** are not secret; they live in the script's
+config (`~/.config/bitbucket-skill/config.json`, set with `config set`).
+
+**`<SECRET>` below is that name.** Run `node "${CLAUDE_SKILL_DIR}/scripts/bitbucket.mjs" config show`
+(no token needed) and use its `runner_env` value verbatim (e.g.
+`BITBUCKET_TOKEN={{secret.BITBUCKET_API_TOKEN}}`, the default name). If the user stored the token
+under another name, save it once: `config set --token-secret <NAME>`; if you don't know the name,
+`credential_store_list` shows the stored names (never values).
 
 1. **Never** call the Bitbucket API or run authenticated `git` against bitbucket.org yourself (curl,
    web fetch, `git clone https://user:token@...`, credential helpers). Always use
@@ -43,23 +49,23 @@ script's config (`~/.config/bitbucket-skill/config.json`, set with `config set`)
    this machine; it sees `${CLAUDE_SKILL_DIR}`), passing the token as an environment variable in
    that one command only. Check the runner's shell with `member_detail`.
 3. apra-fleet substitutes `{{secret.NAME}}` **already quoted** for the runner's shell. Write it
-   bare - `BITBUCKET_TOKEN={{secret.BITBUCKET_API_TOKEN}}`, never inside your own quotes, or the
+   bare - `BITBUCKET_TOKEN={{secret.<SECRET>}}`, never inside your own quotes, or the
    token arrives corrupted and Bitbucket answers 401.
 4. The script never prints the token and redacts `Authorization` from errors.
 
 Git Bash on Windows, or bash/zsh/sh on macOS and Linux:
 ```
-BITBUCKET_TOKEN={{secret.BITBUCKET_API_TOKEN}} node "${CLAUDE_SKILL_DIR}/scripts/bitbucket.mjs" <group> <command> [args]
+BITBUCKET_TOKEN={{secret.<SECRET>}} node "${CLAUDE_SKILL_DIR}/scripts/bitbucket.mjs" <group> <command> [args]
 ```
 PowerShell:
 ```
-$env:BITBUCKET_TOKEN={{secret.BITBUCKET_API_TOKEN}}; node "${CLAUDE_SKILL_DIR}/scripts/bitbucket.mjs" <group> <command> [args]
+$env:BITBUCKET_TOKEN={{secret.<SECRET>}}; node "${CLAUDE_SKILL_DIR}/scripts/bitbucket.mjs" <group> <command> [args]
 ```
 Commands that need no token (`config show|set`, `help`) can run with plain `node` locally.
 
 If `execute_command` reports the secret is missing or blocked by its `network_policy`, ask the user
 to store it (`credential_store_set`, collected out of band) or relax the policy
-(`credential_store_update name=BITBUCKET_API_TOKEN network_policy=allow|confirm`). Never ask for the
+(`credential_store_update name=<SECRET> network_policy=allow|confirm`). Never ask for the
 token in chat.
 
 Output is JSON on stdout. Exit codes: `0` ok, `1` usage, `2` guardrail refusal, `3` API error,
