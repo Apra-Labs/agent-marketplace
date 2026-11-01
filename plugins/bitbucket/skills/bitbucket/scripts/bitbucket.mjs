@@ -80,7 +80,11 @@ export function stateDir() {
   return process.env.BITBUCKET_SKILL_HOME || path.join(os.homedir(), '.config', 'bitbucket-skill');
 }
 const configPath = () => path.join(stateDir(), 'config.json');
-const CONFIG_KEYS = ['credential_type', 'email', 'username', 'workspace'];
+const CONFIG_KEYS = ['credential_type', 'email', 'username', 'workspace', 'token_secret'];
+// Name of the apra-fleet secret holding the token (not the token itself).
+export const DEFAULT_TOKEN_SECRET = 'BITBUCKET_API_TOKEN';
+const SECRET_NAME_RE = /^[A-Za-z0-9_-]{1,64}$/;
+export const tokenSecretName = (cfg) => (cfg && cfg.token_secret) || DEFAULT_TOKEN_SECRET;
 
 export function loadConfig() {
   const p = configPath();
@@ -126,10 +130,10 @@ function checkBase(raw, name) {
 // ---------------------------------------------------------------------------
 // Token and auth
 // ---------------------------------------------------------------------------
-export function readToken() {
+export function readToken(cfg) {
   const t = process.env.BITBUCKET_TOKEN;
   if (!t) {
-    throw cfgErr("BITBUCKET_TOKEN is not set. Run this script through mcp__apra-fleet__execute_command with BITBUCKET_TOKEN='{{secret.<NAME>}}' in the same command.");
+    throw cfgErr(`BITBUCKET_TOKEN is not set. Run this script through mcp__apra-fleet__execute_command with BITBUCKET_TOKEN={{secret.${tokenSecretName(cfg)}}} (bare: apra-fleet substitutes it already quoted) in the same command.`);
   }
   if (/\{\{\s*secret\./.test(t)) {
     throw cfgErr('BITBUCKET_TOKEN still holds an unsubstituted {{secret.<NAME>}} placeholder. Check the secret name and that its scope includes this member.');
@@ -289,7 +293,7 @@ function makeCtx(flags) {
 function authFor(ctx) {
   if (!ctx.auth) {
     const type = credentialType(ctx.cfg);
-    const token = readToken();
+    const token = readToken(ctx.cfg);
     ctx.auth = { type, token, header: restAuthHeader(type, token, ctx.cfg.email) };
   }
   return ctx.auth;
@@ -427,7 +431,7 @@ function takeWs(cfg, args, rest = 0) {
 function cmdConfig(ctx, a) {
   const sub = a._[1] || 'show';
   if (sub === 'show') {
-    return outJson({ config_path: configPath(), ...Object.fromEntries(CONFIG_KEYS.map((k) => [k, ctx.cfg[k] || null])), api_url: apiBase(), git_url: gitBase(), token_in_env: !!process.env.BITBUCKET_TOKEN });
+    return outJson({ config_path: configPath(), ...Object.fromEntries(CONFIG_KEYS.map((k) => [k, ctx.cfg[k] || null])), api_url: apiBase(), git_url: gitBase(), token_secret: tokenSecretName(ctx.cfg), runner_env: `BITBUCKET_TOKEN={{secret.${tokenSecretName(ctx.cfg)}}}`, token_in_env: !!process.env.BITBUCKET_TOKEN });
   }
   if (sub === 'set') {
     const next = { ...ctx.cfg };
@@ -446,7 +450,11 @@ function cmdConfig(ctx, a) {
       next.username = f.username;
     }
     if (f.workspace !== undefined) next.workspace = f.workspace;
-    if (f.type === undefined && f.email === undefined && f.username === undefined && f.workspace === undefined) throw usage('config set needs --type, --email, --username and/or --workspace');
+    if (f['token-secret'] !== undefined) {
+      if (!SECRET_NAME_RE.test(String(f['token-secret']))) throw usage('--token-secret is the NAME of the apra-fleet secret (letters, digits, _ and -, max 64), not the token');
+      next.token_secret = String(f['token-secret']);
+    }
+    if (f.type === undefined && f.email === undefined && f.username === undefined && f.workspace === undefined && f['token-secret'] === undefined) throw usage('config set needs --type, --email, --username, --workspace and/or --token-secret');
     const clean = Object.fromEntries(CONFIG_KEYS.filter((k) => next[k]).map((k) => [k, next[k]]));
     if (ctx.dryRun) return outJson({ dry_run: true, would_save: clean, config_path: configPath() });
     saveConfig(clean);
@@ -517,7 +525,7 @@ function gitPlan(ctx, args, cwd) {
 async function runGitAuthed(ctx, args, { cwd, timeoutMs } = {}) {
   await checkGitVersion(ctx);
   const type = credentialType(ctx.cfg);
-  const token = readToken();
+  const token = readToken(ctx.cfg);
   const inv = buildGitInvocation({ credentialType: type, token, gitBase: gitBase(), args });
   if (ctx.debug) errOut(`DEBUG git ${args.join(' ')}  (auth via env http.extraHeader, ${GIT_USERS[type]})`);
   return spawnGit(inv, { cwd, timeoutMs });
@@ -1063,14 +1071,16 @@ export const HELP = `bitbucket.mjs - Bitbucket Cloud helper for the bitbucket ag
 
 Run it through mcp__apra-fleet__execute_command with the token in BITBUCKET_TOKEN for that
 one command only:
-  BITBUCKET_TOKEN='{{secret.BITBUCKET_TOKEN}}' node <skill>/scripts/bitbucket.mjs <command> ...
+  BITBUCKET_TOKEN={{secret.<NAME>}} node <skill>/scripts/bitbucket.mjs <command> ...
+(write the placeholder bare: apra-fleet substitutes it already quoted; <NAME> is token_secret
+from "config show", default BITBUCKET_API_TOKEN)
 
 <repo> is one token: <ws>/<repo>, or a bare <repo> when config has a workspace.
 <pipeline> is a build number (123 or #123) or a uuid. Output is JSON on stdout.
 
 Config (non-secret; the token is never stored):
   config show
-  config set [--type api_token|access_token] [--email E] [--username U] [--workspace W]
+  config set [--type api_token|access_token] [--email E] [--username U] [--workspace W] [--token-secret NAME]
 Auth:
   auth test [<ws>/<repo>]              REST check + git ls-remote check, JSON report with diagnosis
 Pipelines:
@@ -1120,7 +1130,7 @@ Env: BITBUCKET_TOKEN (secret), BITBUCKET_SKILL_HOME (config dir, default ~/.conf
 Exit codes: 0 ok, 1 usage, 2 guardrail refusal, 3 API error, 4 config error, 5 auth problem.`;
 
 const BOOL_FLAGS = new Set(['dry-run', 'debug', 'help', 'secured', 'close-source', 'draft', 'allow-force']);
-const VALUE_FLAGS = new Set(['type', 'email', 'username', 'workspace', 'status', 'branch', 'limit', 'custom', 'commit', 'out', 'tail', 'tail-lines',
+const VALUE_FLAGS = new Set(['type', 'email', 'username', 'workspace', 'token-secret', 'status', 'branch', 'limit', 'custom', 'commit', 'out', 'tail', 'tail-lines',
   'rank', 'value', 'value-env', 'new-key', 'state', 'title', 'source', 'dest', 'description', 'reviewers', 'body', 'reply-to', 'path', 'line',
   'strategy', 'message', 'from', 'query', 'role', 'C']);
 const FORBIDDEN_FLAGS = {

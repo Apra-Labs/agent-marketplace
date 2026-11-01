@@ -1,8 +1,9 @@
 # Chapter: pipelines
 
 `bb` below is the runner command from SKILL.md:
-`BITBUCKET_TOKEN={{secret.BITBUCKET_API_TOKEN}} node "${CLAUDE_SKILL_DIR}/scripts/bitbucket.mjs"`
-(PowerShell: `$env:BITBUCKET_TOKEN={{secret.BITBUCKET_API_TOKEN}}; node "${CLAUDE_SKILL_DIR}/scripts/bitbucket.mjs"`).
+`BITBUCKET_TOKEN={{secret.<SECRET>}} node "${CLAUDE_SKILL_DIR}/scripts/bitbucket.mjs"`
+(PowerShell: `$env:BITBUCKET_TOKEN={{secret.<SECRET>}}; node "${CLAUDE_SKILL_DIR}/scripts/bitbucket.mjs"`).
+`<SECRET>` is the secret name from `config show` (`runner_env`), see SKILL.md.
 `<repo>` is `<workspace>/<repo>`, or just `<repo>` when the workspace is in the config. A
 `<pipeline>` is a build number (`123`) or a uuid.
 

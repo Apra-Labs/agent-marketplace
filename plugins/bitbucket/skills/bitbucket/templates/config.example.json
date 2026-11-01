@@ -2,5 +2,6 @@
   "credential_type": "api_token",
   "email": "you@example.com",
   "username": "your-bitbucket-username",
-  "workspace": "your-workspace"
+  "workspace": "your-workspace",
+  "token_secret": "BITBUCKET_API_TOKEN"
 }
