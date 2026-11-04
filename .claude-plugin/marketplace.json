@@ -37,22 +37,6 @@
         "remote-access",
         "apra-fleet"
       ]
-    },
-    {
-      "name": "redactor",
-      "source": "./plugins/redactor",
-      "description": "Routes your MCP servers through apra-redactor-mcp, a local proxy that removes secrets and personal data from tool results before Claude sees them. Requires uv (the server runs via uvx from PyPI) or Docker; no apra-fleet needed.",
-      "version": "0.1.0",
-      "category": "security",
-      "keywords": [
-        "redaction",
-        "pii",
-        "secrets",
-        "mcp",
-        "proxy",
-        "security",
-        "privacy"
-      ]
     }
   ]
 }
