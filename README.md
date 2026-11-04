@@ -26,4 +26,4 @@ Skills follow the open [Agent Skills](https://agentskills.io) format, so the `SK
 
 ## Contributing
 
-Each plugin's source lives in its folder here (tests in `plugins/<name>/tests/`; run `npm test` from the root). A plugin gets its own source repo only for a concrete reason (see CLAUDE.md rule 1); none does today. See [CLAUDE.md](CLAUDE.md) for the rules.
+Each plugin's source lives in its folder here (tests in `plugins/<name>/tests/`; run `npm test` from the root). A plugin gets its own source repo only for a concrete reason (see CLAUDE.md rule 1); the first is redactor, created and updated by `scripts/sync-redactor.mjs` when it is released. See [CLAUDE.md](CLAUDE.md) for the rules.
