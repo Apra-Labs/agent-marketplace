@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import {
   normalizeAclSpec, parseAclEntry, resolveAcl, validateAutoClose, validateIdle, computeHardExpiry,
   parseRemote, validateStoredAcl, optionsFromStored, validateStored, aclEquals, aclCoversIp, LIMITS,
+  assertAllowedRequest, validateScriptTimeout, pickLibraryScript, buildScriptRunBody, checkBodySize, tailLines, scriptSha256,
 } from '../skills/rport/scripts/rport.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -40,7 +41,27 @@ function freshState() {
     nextStored: 1,
     active: new Set(),
     log: [],
+    library: [], // { id, name, script, interpreter, cwd, is_sudo, timeout_sec, tags, created_by, created_at, updated_at }
+    nextScript: 1,
+    jobs: [], // { jid, client_id, ..., _seq: statuses returned by successive GETs, _script }
+    nextJid: 1,
+    jobSeq: ['successful'], // statuses a new job reports on successive GETs (last one sticks)
+    jobOut: { stdout: 'ok\n', stderr: '', summary: 'done' },
+    scriptErr: null, // { status, title } returned by POST /clients/{id}/scripts
   };
+}
+function seedScript(fields, S = state) {
+  const now = new Date().toISOString();
+  const s = { id: `scr-${S.nextScript++}`, name: 'x', script: 'echo hi\n', interpreter: '', cwd: '', is_sudo: false, timeout_sec: 60, tags: [], created_by: USER, created_at: now, updated_at: now, ...fields };
+  S.library.push(s);
+  return s;
+}
+const publicJob = ({ _seq, _script, ...rest }) => rest;
+function jobNext(j) {
+  if (j._seq.length > 1) j.status = j._seq.shift();
+  else j.status = j._seq[0];
+  if (j.status !== 'running' && !j.finished_at) j.finished_at = new Date().toISOString();
+  return j;
 }
 function resetState() {
   if (state) allLogs.push(...state.log, ...stateB.log);
@@ -127,6 +148,47 @@ const server = http.createServer((req, res) => {
       S.tunnels.splice(i, 1);
       return send(res, 204);
     }
+    // ---- script library
+    if (p === '/library/scripts') {
+      if (req.method === 'GET') {
+        const lim = Number(url.searchParams.get('page[limit]') || 50);
+        const off = Number(url.searchParams.get('page[offset]') || 0);
+        return send(res, 200, { data: S.library.slice(off, off + lim), meta: { count: S.library.length } });
+      }
+      if (req.method === 'POST') return send(res, 200, { data: seedScript(JSON.parse(body), S) });
+    }
+    if ((m = /^\/library\/scripts\/([^/]+)$/.exec(p))) {
+      const i = S.library.findIndex((s) => s.id === m[1]);
+      if (i < 0) return send(res, 404, errBody('', 'script not found'));
+      if (req.method === 'GET') return send(res, 200, { data: S.library[i] });
+      if (req.method === 'PUT') {
+        S.library[i] = { ...S.library[i], ...JSON.parse(body), updated_at: new Date().toISOString() };
+        return send(res, 200, { data: S.library[i] });
+      }
+      if (req.method === 'DELETE') { S.library.splice(i, 1); return send(res, 204); }
+    }
+    // ---- run on one client + jobs
+    if (req.method === 'POST' && (m = /^\/clients\/([^/]+)\/scripts$/.exec(p))) {
+      const c = S.clients.find((x) => x.id === m[1]);
+      if (!c || c.connection_state !== 'connected') return send(res, 404, errBody('', `Active client with id=${m[1]} not found`));
+      if (S.scriptErr) return send(res, S.scriptErr.status, errBody('', S.scriptErr.title));
+      const b = JSON.parse(body);
+      const j = {
+        jid: `job-${S.nextJid++}`, client_id: c.id, client_name: c.name, status: 'running', interpreter: b.interpreter || '/bin/sh', cwd: b.cwd || '',
+        is_sudo: b.is_sudo, timeout_sec: b.timeout_sec, started_at: new Date().toISOString(), finished_at: null, created_by: USER, error: '',
+        result: { ...S.jobOut }, _seq: [...S.jobSeq], _script: Buffer.from(b.script, 'base64').toString('utf8'),
+      };
+      S.jobs.push(j);
+      return send(res, 200, { data: { jid: j.jid } });
+    }
+    if (req.method === 'GET' && (m = /^\/clients\/([^/]+)\/commands\/([^/]+)$/.exec(p))) {
+      const j = S.jobs.find((x) => x.client_id === m[1] && x.jid === m[2]);
+      return j ? send(res, 200, { data: publicJob(jobNext(j)) }) : send(res, 404, errBody('', 'job not found'));
+    }
+    if (req.method === 'GET' && (m = /^\/clients\/([^/]+)\/commands$/.exec(p))) {
+      const lim = Number(url.searchParams.get('page[limit]') || 50);
+      return send(res, 200, { data: S.jobs.filter((x) => x.client_id === m[1]).map(publicJob).reverse().slice(0, lim) });
+    }
     return send(res, 404, errBody('', 'no route'));
   });
 });
@@ -153,7 +215,7 @@ function newHome() {
 
 function run(home, args, env = {}) {
   return new Promise((resolve) => {
-    execFile(process.execPath, [CLI, ...args], { env: { ...process.env, RPORT_TOKEN: SENTINEL, RPORT_SKILL_HOME: home, ...env } }, (err, stdout, stderr) => {
+    execFile(process.execPath, [CLI, ...args], { env: { ...process.env, RPORT_TOKEN: SENTINEL, RPORT_SKILL_HOME: home, RPORT_SKILL_POLL_MS: '20', ...env } }, (err, stdout, stderr) => {
       outputs.push(stdout, stderr);
       resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout, stderr });
     });
@@ -700,6 +762,329 @@ test('runner member: global setting with per-server override', async () => {
   assert.equal(JSON.parse((await run(home, ['server', 'show', '--json'])).stdout).runner_member, 'my-runner');
 });
 
+// ---------------------------------------------------------------- scripts
+const scriptsHome = async () => setup({ stored: null });
+const runPosts = () => writes().filter((e) => e.method === 'POST' && /\/clients\/[^/]+\/scripts$/.test(e.path));
+const jobGets = () => state.log.filter((e) => e.method === 'GET' && /\/commands\/[^/]+$/.test(e.path));
+
+test('scripts unit: timeout caps, name resolution, run body, body size, tails, allowed endpoints', () => {
+  assert.equal(validateScriptTimeout(undefined, undefined), 60);
+  assert.equal(validateScriptTimeout(undefined, 0), 60, 'library 0 -> server default 60');
+  assert.equal(validateScriptTimeout(undefined, 300), 300);
+  assert.equal(validateScriptTimeout('3600', 300), 3600);
+  const refused = (fn, re) => assert.throws(fn, (e) => e.exitCode === 2 && re.test(e.message));
+  refused(() => validateScriptTimeout('3601'), /maximum of 3600/);
+  refused(() => validateScriptTimeout(undefined, 7200), /maximum of 3600/);
+  refused(() => validateScriptTimeout('0'), /timeout 0/);
+  refused(() => validateScriptTimeout('1.5'), /whole number/);
+
+  const lib = [{ id: 'a', name: 'Disk-Check' }, { id: 'b', name: 'disk-check' }, { id: 'c', name: 'uptime' }, { id: 'd', name: 'Dup' }, { id: 'e', name: 'Dup' }];
+  assert.equal(pickLibraryScript(lib, 'disk-check').id, 'b', 'exact name wins');
+  assert.equal(pickLibraryScript(lib, 'UPTIME').id, 'c', 'case-insensitive');
+  assert.equal(pickLibraryScript(lib, 'c').id, 'c', 'by id');
+  assert.throws(() => pickLibraryScript(lib, 'DISK-CHECK'), (e) => e.exitCode === 1 && /Disk-Check \(id a\).*disk-check \(id b\)/.test(e.message));
+  assert.throws(() => pickLibraryScript(lib, 'Dup'), (e) => e.exitCode === 1 && /id d.*id e/.test(e.message));
+  assert.throws(() => pickLibraryScript(lib, 'nope'), (e) => e.exitCode === 4);
+
+  const b = buildScriptRunBody({ script: 'echo hi\n', interpreter: 'bash' }, { timeout: 30, cwd: '/tmp' });
+  assert.deepEqual(b, { script: Buffer.from('echo hi\n').toString('base64'), interpreter: 'bash', cwd: '/tmp', is_sudo: false, timeout_sec: 30 });
+  assert.equal(buildScriptRunBody({ script: 'x' }, { isSudo: true, timeout: 1 }).is_sudo, true);
+  assert.ok(!('interpreter' in buildScriptRunBody({ script: 'x', interpreter: '' }, { timeout: 1 })), 'no interpreter -> server default');
+  refused(() => checkBodySize({ script: 'x'.repeat(10300) }, 's'), /10240/);
+  assert.ok(checkBodySize({ script: 'x' }, 's') < 100);
+
+  assert.equal(tailLines(Array.from({ length: 100 }, (_, i) => `l${i}`).join('\n') + '\n').split('\n').length, 60);
+  assert.equal(tailLines(''), '');
+  assert.equal(scriptSha256('abc'), 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
+
+  for (const [m, p] of [['POST', '/clients/c-1/commands'], ['POST', '/commands'], ['POST', '/scripts'], ['PUT', '/scripts/x'], ['GET', '/ws/commands'], ['GET', '/ws/scripts'], ['POST', '/client-groups/g/commands'], ['POST', '/client-groups/g/scripts'], ['PUT', '/clients/c-1/scripts'], ['DELETE', '/clients/c-1/commands/j']]) {
+    assert.throws(() => assertAllowedRequest(m, p), (e) => e.exitCode === 2, `${m} ${p} must be refused`);
+  }
+  for (const [m, p] of [['POST', '/clients/c-1/scripts'], ['GET', '/clients/c-1/commands'], ['GET', '/clients/c-1/commands/j'], ['GET', '/library/scripts'], ['POST', '/library/scripts'], ['PUT', '/library/scripts/1'], ['DELETE', '/library/scripts/1'], ['PUT', '/clients/c-1/tunnels']]) {
+    assert.doesNotThrow(() => assertAllowedRequest(m, p), `${m} ${p}`);
+  }
+});
+
+test('scripts list / show: no bodies in list, --query, exact, case-insensitive, id, ambiguous', async () => {
+  const home = await scriptsHome();
+  seedScript({ name: 'Disk-Check', script: 'df -h\n', interpreter: 'bash', tags: ['disk'] });
+  seedScript({ name: 'disk-check', script: 'df -k\n' });
+  seedScript({ name: 'uptime', script: 'uptime\n', is_sudo: true, timeout_sec: 10 });
+  let r = await run(home, ['scripts', 'list', '--json']);
+  assert.equal(r.code, 0, r.stderr);
+  const rows = JSON.parse(r.stdout);
+  assert.equal(rows.length, 3);
+  assert.deepEqual(Object.keys(rows[0]).sort(), ['id', 'interpreter', 'is_sudo', 'name', 'tags', 'timeout_sec', 'updated_at']);
+  assert.ok(!r.stdout.includes('df -h'), 'no script bodies in list');
+  r = await run(home, ['scripts', 'list', '--query', 'DISK', '--json']);
+  assert.deepEqual(JSON.parse(r.stdout).map((s) => s.name), ['Disk-Check', 'disk-check']);
+  r = await run(home, ['scripts', 'show', 'disk-check', '--json']);
+  assert.equal(JSON.parse(r.stdout).script, 'df -k\n', 'exact name');
+  r = await run(home, ['scripts', 'show', 'UPTIME', '--json']);
+  assert.equal(JSON.parse(r.stdout).id, 'scr-3', 'case-insensitive');
+  assert.equal(JSON.parse(r.stdout).script_sha256, scriptSha256('uptime\n'));
+  r = await run(home, ['scripts', 'show', 'scr-1', '--json']);
+  assert.equal(JSON.parse(r.stdout).name, 'Disk-Check', 'by id');
+  r = await run(home, ['scripts', 'show', 'DISK-CHECK']);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /Disk-Check \(id scr-1\), disk-check \(id scr-2\)/);
+  r = await run(home, ['scripts', 'show', 'nothing']);
+  assert.equal(r.code, 4);
+  assert.equal(writes().length, 0);
+});
+
+test('scripts run --dry-run sends nothing and shows hash, lines, preview, method and url', async () => {
+  const home = await scriptsHome();
+  const text = Array.from({ length: 30 }, (_, i) => `echo line${i}`).join('\n') + '\n';
+  seedScript({ name: 'many', script: text, interpreter: 'bash', cwd: '/srv', timeout_sec: 120 });
+  const r = await run(home, ['scripts', 'run', 'many', ...K, '--dry-run']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(writes().length, 0, 'dry-run sent nothing');
+  assert.equal(state.jobs.length, 0);
+  const plan = JSON.parse(r.stdout.split(/\r?\n/).find((l) => l.startsWith('PLAN ')).slice(5));
+  assert.equal(plan.script_sha256, scriptSha256(text));
+  assert.equal(plan.script_lines, 30);
+  assert.equal(plan.script_preview.length, 20);
+  assert.equal(plan.script_preview[0], 'echo line0');
+  assert.deepEqual([plan.client_id, plan.script_name, plan.interpreter, plan.cwd, plan.is_sudo, plan.timeout_sec, plan.method], ['c-1', 'many', 'bash', '/srv', false, 120, 'POST']);
+  assert.match(plan.url, /\/api\/v1\/clients\/c-1\/scripts$/);
+  assert.match(r.stdout, /DRY-RUN would call: POST .*\/clients\/c-1\/scripts  Authorization: Basic \[REDACTED\]/);
+  assert.equal(ledgerOf(home).length, 0, 'no ledger record');
+  assert.ok(!fs.existsSync(path.join(home, 'jobs')));
+});
+
+test('scripts run: base64 body from the library, polls running -> successful, tails and full job file, ledger', async () => {
+  const home = await scriptsHome();
+  const text = '#!/bin/bash\nfor i in $(seq 1 100); do echo out$i; done\n';
+  const lib = seedScript({ name: 'Count', script: text, interpreter: 'bash', cwd: '/tmp', timeout_sec: 120 });
+  state.jobSeq = ['running', 'running', 'successful'];
+  state.jobOut = { stdout: Array.from({ length: 100 }, (_, i) => `out${i + 1}`).join('\n') + '\n', stderr: 'warn\n', summary: 'done' };
+  const r = await run(home, ['scripts', 'run', 'count', ...K]);
+  assert.equal(r.code, 0, r.stderr);
+  const [post] = runPosts();
+  assert.equal(post.path, '/api/v1/clients/c-1/scripts');
+  const body = JSON.parse(post.body);
+  assert.equal(Buffer.from(body.script, 'base64').toString('utf8'), text, 'standard base64 of the library text');
+  assert.deepEqual([body.is_sudo, body.interpreter, body.cwd, body.timeout_sec], [false, 'bash', '/tmp', 120]);
+  assert.equal(writes().length, 1, 'exactly one write: the run');
+  assert.ok(jobGets().length >= 3, 'polled until done');
+  const res = resultOf(r.stdout);
+  assert.equal(res.status, 'successful');
+  assert.equal(res.jid, 'job-1');
+  assert.equal(res.script_name, 'Count');
+  assert.equal(res.script_sha256, scriptSha256(text));
+  const tail = res.stdout_tail.split('\n');
+  assert.equal(tail.length, 60);
+  assert.equal(tail.at(-1), 'out100');
+  assert.equal(res.stderr_tail, 'warn');
+  assert.equal(res.output_file, path.join(home, 'jobs', 'job-1.json'));
+  const full = JSON.parse(fs.readFileSync(res.output_file, 'utf8'));
+  assert.equal(full.result.stdout.split('\n').filter(Boolean).length, 100, 'full output in the file');
+  const [rec] = ledgerOf(home);
+  assert.equal(rec.action, 'script-run');
+  assert.ok(rec.ts);
+  assert.deepEqual([rec.server, rec.client_id, rec.script_id, rec.script_name, rec.sha256, rec.is_sudo, rec.timeout_sec, rec.jid, rec.status],
+    ['default', 'c-1', lib.id, 'Count', scriptSha256(text), false, 120, 'job-1', 'successful']);
+  const led = await run(home, ['ledger']);
+  assert.match(led.stdout, /script-run  Count/);
+  // --out, --timeout, --cwd override the library
+  const outFile = path.join(home, 'custom', 'job.json');
+  const r2 = await run(home, ['scripts', 'run', 'Count', ...K, '--timeout', '30', '--cwd', '/var', '--out', outFile, '--json']);
+  assert.equal(r2.code, 0, r2.stderr);
+  const b2 = JSON.parse(runPosts()[1].body);
+  assert.deepEqual([b2.timeout_sec, b2.cwd], [30, '/var']);
+  assert.equal(resultOf(r2.stdout).output_file, outFile);
+  assert.ok(fs.existsSync(outFile));
+});
+
+test('scripts run: is_sudo library script refused without --sudo, sent with --sudo', async () => {
+  const home = await scriptsHome();
+  seedScript({ name: 'root-job', script: 'id\n', is_sudo: true });
+  seedScript({ name: 'plain', script: 'id\n', is_sudo: false });
+  let r = await run(home, ['scripts', 'run', 'root-job', ...K]);
+  assert.equal(r.code, 2);
+  assert.match(r.stderr, /is_sudo=true: it requires elevation/);
+  assert.match(r.stderr, /explicitly asks/);
+  assert.equal(writes().length, 0);
+  r = await run(home, ['scripts', 'run', 'root-job', ...K, '--sudo']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(JSON.parse(runPosts()[0].body).is_sudo, true);
+  assert.equal(ledgerOf(home)[0].is_sudo, true);
+  r = await run(home, ['scripts', 'run', 'plain', ...K]);
+  assert.equal(JSON.parse(runPosts()[1].body).is_sudo, false, 'never sudo unless asked');
+});
+
+test('scripts run guardrails: timeout > 3600, body > 10240, disconnected client, ad-hoc flags', async () => {
+  const home = await scriptsHome();
+  seedScript({ name: 'small', script: 'echo hi\n' });
+  seedScript({ name: 'long', script: 'sleep 1\n', timeout_sec: 7200 });
+  seedScript({ name: 'big', script: '# pad\n' + 'x'.repeat(8000) + '\n' });
+  let r = await run(home, ['scripts', 'run', 'small', ...K, '--timeout', '3601']);
+  assert.equal(r.code, 2);
+  assert.match(r.stderr, /maximum of 3600/);
+  r = await run(home, ['scripts', 'run', 'long', ...K]);
+  assert.equal(r.code, 2, 'library timeout above the cap is refused too');
+  r = await run(home, ['scripts', 'run', 'big', ...K]);
+  assert.equal(r.code, 2);
+  assert.match(r.stderr, /above the server limit of 10240 bytes/);
+  assert.match(r.stderr, /[Ss]plit/);
+  r = await run(home, ['scripts', 'run', 'small', '--client', 'offline-box']);
+  assert.equal(r.code, 2);
+  assert.match(r.stderr, /not connected/);
+  r = await run(home, ['scripts', 'run', 'small']);
+  assert.equal(r.code, 1, '--client is required');
+  r = await run(home, ['scripts', 'run', 'small', 'other', ...K]);
+  assert.equal(r.code, 1, 'one script per run');
+  for (const f of [['--script', 'rm -rf /'], ['--command', 'id'], ['--clients', 'a,b'], ['--group', 'g']]) {
+    r = await run(home, ['scripts', 'run', 'small', ...K, ...f]);
+    assert.equal(r.code, 2, f[0]);
+  }
+  assert.equal(writes().length, 0, 'nothing sent');
+});
+
+test('scripts run: server/client refusals mapped to clear explanations', async () => {
+  const home = await scriptsHome();
+  seedScript({ name: 'small', script: 'echo hi\n' });
+  const cases = [
+    [{ status: 409, title: 'remote scripts are disabled' }, [/REFUSED by the client/, /\[remote-scripts\] enabled = true/, /\[remote-commands\] enabled = true/, /rport\.conf/]],
+    [{ status: 409, title: 'remote commands execution is disabled' }, [/\[remote-commands\] enabled = true/]],
+    [{ status: 409, title: 'a previous command is still running' }, [/still running/, /scripts jobs/]],
+    [{ status: 403, title: 'the scope of the provided token is not authorized for this operation' }, [/read\+write token/]],
+    [{ status: 401, title: 'the scope of the provided token is not authorized for this operation' }, [/read\+write token/]],
+    [{ status: 403, title: 'forbidden' }, [/`scripts` permission/, /access to that client/]],
+  ];
+  for (const [err, res] of cases) {
+    state.scriptErr = err;
+    const r = await run(home, ['scripts', 'run', 'small', ...K]);
+    assert.equal(r.code, 3, `${err.title}: ${r.stderr}`);
+    for (const re of res) assert.match(r.stderr, re, err.title);
+  }
+  assert.equal(ledgerOf(home).length, 0, 'no ledger record for a refused run');
+  state.scriptErr = null;
+  state.clients[0].connection_state = 'connected';
+  state.clients.push({ id: 'c-3', name: 'paused', connection_state: 'connected' });
+  // A client that looks connected but the server says is not active (e.g. paused) -> 404 hint.
+  state.clients[2].connection_state = 'paused';
+  const r = await run(home, ['scripts', 'run', 'small', '--client', 'paused']);
+  assert.equal(r.code, 3);
+  assert.match(r.stderr, /not active \(disconnected or paused\)/);
+});
+
+test('scripts run: still running after --wait, and status unknown', async () => {
+  const home = await scriptsHome();
+  seedScript({ name: 'slow', script: 'sleep 999\n', timeout_sec: 900 });
+  state.jobSeq = ['running'];
+  let r = await run(home, ['scripts', 'run', 'slow', ...K, '--wait', '0']);
+  assert.equal(r.code, 0, r.stderr);
+  let res = resultOf(r.stdout);
+  assert.equal(res.status, 'running');
+  assert.equal(res.jid, 'job-1');
+  assert.match(res.note, /scripts job c-1 job-1/);
+  assert.ok(fs.existsSync(res.output_file), 'partial job file written');
+  assert.equal(ledgerOf(home)[0].status, 'running');
+
+  state.jobSeq = ['running', 'unknown'];
+  r = await run(home, ['scripts', 'run', 'slow', ...K]);
+  res = resultOf(r.stdout);
+  assert.equal(res.status, 'unknown');
+  assert.match(res.note, /may still be running on the client/);
+  assert.match(r.stdout, /NOTE: .*may still be running/);
+});
+
+test('scripts job / jobs', async () => {
+  const home = await scriptsHome();
+  seedScript({ name: 'small', script: 'echo hi\n' });
+  await run(home, ['scripts', 'run', 'small', ...K]);
+  state.jobOut = { stdout: 'second\n', stderr: '', summary: '' };
+  await run(home, ['scripts', 'run', 'small', ...K]);
+  const outFile = path.join(home, 'one.json');
+  let r = await run(home, ['scripts', 'job', 'my-server', 'job-1', '--out', outFile, '--json']);
+  assert.equal(r.code, 0, r.stderr);
+  const res = resultOf(r.stdout);
+  assert.deepEqual([res.jid, res.status, res.stdout_tail, res.output_file], ['job-1', 'successful', 'ok', outFile]);
+  assert.equal(JSON.parse(fs.readFileSync(outFile, 'utf8')).jid, 'job-1');
+  r = await run(home, ['scripts', 'jobs', 'my-server', '--limit', '1', '--json']);
+  assert.equal(r.code, 0, r.stderr);
+  const rows = JSON.parse(r.stdout);
+  assert.equal(rows.length, 1);
+  assert.ok(!('result' in rows[0]), 'no full output in the job list');
+  assert.equal(state.log.find((e) => e.path === '/api/v1/clients/c-1/commands').query['page[limit]'], '1');
+  r = await run(home, ['scripts', 'job', 'my-server', 'job-99']);
+  assert.equal(r.code, 3);
+  assert.equal(writes().length, 2, 'only the two runs wrote');
+});
+
+test('scripts add / update / delete: dry-run sends nothing; real calls carry the file content', async () => {
+  const home = await scriptsHome();
+  const file = path.join(home, 'check.sh');
+  fs.writeFileSync(file, '#!/bin/sh\ndf -h\nuptime\n');
+  const dry = async (args, re) => {
+    const r = await run(home, [...args, '--dry-run']);
+    assert.equal(r.code, 0, `${args.join(' ')}: ${r.stderr}`);
+    assert.equal(writes().length, 0, `${args.join(' ')} made a write`);
+    assert.match(r.stdout, re);
+    return r;
+  };
+  let r = await dry(['scripts', 'add', 'check', '--file', file, '--interpreter', 'sh', '--tags', 'disk, ops', '--timeout', '90'], /DRY-RUN would call: POST .*\/library\/scripts/);
+  assert.match(r.stdout, new RegExp(`sha256 ${scriptSha256('#!/bin/sh\ndf -h\nuptime\n')}`));
+  assert.match(r.stdout, /\| df -h/);
+  assert.ok(!r.stdout.includes('"script":"#!/bin/sh'), 'script text not inlined in the plan');
+  assert.equal(state.library.length, 0);
+
+  r = await run(home, ['scripts', 'add', 'check', '--file', file, '--interpreter', 'sh', '--tags', 'disk, ops', '--timeout', '90']);
+  assert.equal(r.code, 0, r.stderr);
+  const post = writes()[0];
+  assert.deepEqual([post.method, post.path], ['POST', '/api/v1/library/scripts']);
+  assert.deepEqual(JSON.parse(post.body), { name: 'check', script: '#!/bin/sh\ndf -h\nuptime\n', interpreter: 'sh', is_sudo: false, timeout_sec: 90, tags: ['disk', 'ops'] });
+  assert.equal((await run(home, ['scripts', 'add', 'check', '--file', file])).code, 4, 'duplicate name');
+  assert.equal((await run(home, ['scripts', 'add', 'other'])).code, 1, '--file required');
+  assert.equal((await run(home, ['scripts', 'add', 'other', '--file', path.join(home, 'missing.sh')])).code, 4);
+  assert.equal((await run(home, ['scripts', 'add', 'other', '--script', 'id'])).code, 2, 'no script text on argv');
+
+  state.log = [];
+  fs.writeFileSync(file, 'uptime\n');
+  await dry(['scripts', 'update', 'check', '--file', file, '--sudo'], /DRY-RUN .*changes: script, is_sudo[\s\S]*PUT .*\/library\/scripts\/scr-1/);
+  assert.equal(state.library[0].script, '#!/bin/sh\ndf -h\nuptime\n');
+  r = await run(home, ['scripts', 'update', 'check', '--file', file, '--sudo', '--name', 'check2']);
+  assert.equal(r.code, 0, r.stderr);
+  const put = writes()[0];
+  assert.deepEqual([put.method, put.path], ['PUT', '/api/v1/library/scripts/scr-1']);
+  const pb = JSON.parse(put.body);
+  assert.deepEqual([pb.name, pb.script, pb.is_sudo, pb.interpreter, pb.timeout_sec, pb.tags], ['check2', 'uptime\n', true, 'sh', 90, ['disk', 'ops']], 'full object, other fields kept');
+  r = await run(home, ['scripts', 'update', 'check2', '--no-sudo']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(state.library[0].is_sudo, false);
+  assert.equal((await run(home, ['scripts', 'update', 'check2'])).code, 1, 'nothing to change');
+  assert.equal((await run(home, ['scripts', 'update', 'check2', '--sudo', '--no-sudo'])).code, 1);
+
+  state.log = [];
+  await dry(['scripts', 'delete', 'check2'], /DRY-RUN would call: DELETE .*\/library\/scripts\/scr-1/);
+  assert.equal(state.library.length, 1);
+  r = await run(home, ['scripts', 'delete', 'CHECK2']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.deepEqual([writes()[0].method, writes()[0].path], ['DELETE', '/api/v1/library/scripts/scr-1']);
+  assert.equal(state.library.length, 0);
+});
+
+test('no request ever went to an ad-hoc execution endpoint, and none can', () => {
+  allLogs.push(...state.log, ...stateB.log);
+  state.log = [];
+  stateB.log = [];
+  const bad = allLogs.filter((e) => {
+    const p = e.path.replace(/^(\/b)?\/api\/v1/, '');
+    if (/(^|\/)ws(\/|$)/.test(p)) return true;
+    if (e.method === 'GET') return false;
+    return /^\/commands(\/|$)/.test(p) || /^\/scripts(\/|$)/.test(p) || /^\/clients\/[^/]+\/commands(\/|$)/.test(p) || /^\/client-groups\//.test(p);
+  });
+  assert.deepEqual(bad, []);
+  assert.ok(allLogs.some((e) => e.method === 'POST' && /\/clients\/c-1\/scripts$/.test(e.path)), 'the library run path was exercised');
+  // Static: the source names no other execution endpoint, and every request goes through the guard.
+  const src = fs.readFileSync(CLI, 'utf8');
+  assert.ok(!/['"`]\/commands['"`]/.test(src) && !/['"`]\/scripts['"`]/.test(src) && !/['"`]\/ws/.test(src), 'no literal ad-hoc endpoint');
+  assert.equal((src.match(/await fetch\(/g) || []).length, 1, 'one fetch call site');
+  assert.match(src, /async function api\([^)]*\) \{\n  assertAllowedRequest\(method, p\);/);
+});
+
 test('the token never appears in stdout, stderr, ledger, config, URLs or bodies', () => {
   allLogs.push(...state.log, ...stateB.log);
   assert.ok(outputs.length > 40, 'collected output from the CLI runs');
@@ -707,9 +1092,10 @@ test('the token never appears in stdout, stderr, ledger, config, URLs or bodies'
     assert.ok(!o.includes(SENTINEL), 'sentinel token leaked to output');
     assert.ok(!o.includes(BASIC), 'basic auth header leaked to output');
   }
+  const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).flatMap((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : [path.join(d, e.name)]));
   for (const h of homes) {
-    for (const f of fs.readdirSync(h)) {
-      const c = fs.readFileSync(path.join(h, f), 'utf8');
+    for (const f of walk(h)) {
+      const c = fs.readFileSync(f, 'utf8');
       assert.ok(!c.includes(SENTINEL) && !c.includes(BASIC), `token leaked into ${f}`);
     }
   }

@@ -33,6 +33,13 @@ export const LIMITS = Object.freeze({
   WARN_MINUTES: 15,
   CREATE_LOOP_WINDOW_MINUTES: 15,
   CREATE_LOOP_MAX: 3,
+  SCRIPT_TIMEOUT_DEFAULT: 60, // seconds; the server's own default
+  SCRIPT_TIMEOUT_MAX: 3600, // hard maximum 1h
+  SCRIPT_BODY_MAX_BYTES: 10240, // the server's default [api] max_request_bytes
+  SCRIPT_WAIT_EXTRA: 15, // default --wait = timeout_sec + this
+  SCRIPT_POLL_SECONDS: 2,
+  SCRIPT_TAIL_LINES: 60,
+  SCRIPT_PREVIEW_LINES: 20,
 });
 
 export const EXIT = Object.freeze({ OK: 0, USAGE: 1, GUARDRAIL: 2, API: 3, CONFIG: 4 });
@@ -438,7 +445,20 @@ function displayUrl(url) {
   return decodeURIComponent(u.toString());
 }
 
+// No ad-hoc execution: the only execution endpoint ever written to is POST /clients/{id}/scripts,
+// and only cmdScriptsRun calls it, with the text of a library script. Every request passes here.
+export function assertAllowedRequest(method, p) {
+  const route = String(p).split('?')[0];
+  if (/(^|\/)ws(\/|$)/.test(route)) throw guard(`${route}: websocket endpoints are never used (no interactive/ad-hoc execution).`);
+  if (String(method).toUpperCase() === 'GET') return;
+  if (!/\/(commands|scripts)(\/|$)/.test(route)) return;
+  if (/^\/library\/scripts(\/[^/]+)?$/.test(route)) return; // script library admin
+  if (String(method).toUpperCase() === 'POST' && /^\/clients\/[^/]+\/scripts$/.test(route)) return; // one library script, one client
+  throw guard(`${method} ${route}: ad-hoc commands, multi-client runs and group runs are never sent. Only a script from the server's library runs, on one client (scripts run).`);
+}
+
 async function api(ctx, conn, method, p, { query, body, write = false, hint404 } = {}) {
+  assertAllowedRequest(method, p);
   const url = new URL(conn.base + p);
   for (const [k, v] of Object.entries(query || {})) if (v !== undefined && v !== null && v !== '') url.searchParams.set(k, String(v));
   const shown = displayUrl(url);
@@ -1048,7 +1068,389 @@ function cmdLedger(ctx, a) {
   }
   if (ctx.json) return out(JSON.stringify(recs));
   if (!recs.length) return out('ledger is empty for that selection');
-  for (const r of recs) out(`${r.at}  ${r.def}  ${r.action}  tunnel ${r.tunnel_id}@${r.client_id}  ${r.host}:${r.lport}${r.acl ? '  acl=' + r.acl : ''}${r.hard_expires_at ? '  hard_expires_at=' + r.hard_expires_at : ''}${r.superseded ? '  (superseded)' : ''}`);
+  for (const r of recs) if (r.action === 'script-run') out(`${r.at}  script-run  ${r.script_name} (id ${r.script_id}, sha256 ${String(r.sha256 || '').slice(0, 12)})  client ${r.client_id}  jid=${r.jid}  status=${r.status}  sudo=${r.is_sudo}  timeout=${r.timeout_sec}s`);
+  else out(`${r.at}  ${r.def}  ${r.action}  tunnel ${r.tunnel_id}@${r.client_id}  ${r.host}:${r.lport}${r.acl ? '  acl=' + r.acl : ''}${r.hard_expires_at ? '  hard_expires_at=' + r.hard_expires_at : ''}${r.superseded ? '  (superseded)' : ''}`);
+}
+
+// ---------------------------------------------------------------------------
+// Scripts: the server's script library, and running ONE library script on ONE client.
+// RPort has no "run library script by id" call: we read the entry and POST its exact text
+// (base64) to /clients/{id}/scripts, then poll /clients/{id}/commands/{jid}.
+// ---------------------------------------------------------------------------
+const LIB = '/library/scripts';
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// RPORT_SKILL_POLL_MS: test hook to poll faster than every 2s.
+const pollMs = () => (Number(process.env.RPORT_SKILL_POLL_MS) > 0 ? Number(process.env.RPORT_SKILL_POLL_MS) : LIMITS.SCRIPT_POLL_SECONDS * 1000);
+
+export const scriptSha256 = (text) => crypto.createHash('sha256').update(String(text), 'utf8').digest('hex');
+export function scriptLines(text) {
+  const lines = String(text ?? '').split(/\r?\n/);
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  return lines;
+}
+export function tailLines(text, n = LIMITS.SCRIPT_TAIL_LINES) {
+  if (text === undefined || text === null || text === '') return '';
+  return scriptLines(text).slice(-n).join('\n');
+}
+
+function wholeNumber(v, what) {
+  if (!/^\d+$/.test(String(v))) throw usage(`${what} "${v}" must be a whole number`);
+  return Number(v);
+}
+
+// timeout_sec for a run (or a library entry): given value, else the fallback (library), else 60; 1..3600.
+export function validateScriptTimeout(v, fallback) {
+  const given = v !== undefined && v !== null && v !== '';
+  const noFallback = fallback === undefined || fallback === null || fallback === '' || Number(fallback) === 0;
+  const x = given ? v : (noFallback ? LIMITS.SCRIPT_TIMEOUT_DEFAULT : fallback);
+  if (!/^\d+$/.test(String(x))) throw guard(`timeout "${x}" must be a whole number of seconds.`);
+  const n = Number(x);
+  if (n < 1) throw guard('timeout 0 is not allowed; every script run needs a timeout (default 60s).');
+  if (n > LIMITS.SCRIPT_TIMEOUT_MAX) throw guard(`timeout ${n}s is above the maximum of ${LIMITS.SCRIPT_TIMEOUT_MAX}s (1h). Split long work into shorter scripts.`);
+  return n;
+}
+
+// Library entry by exact name, then case-insensitive name, then id. Ambiguous -> usage error.
+export function pickLibraryScript(list, ref) {
+  const r = String(ref ?? '');
+  if (!r) throw usage('a library script name or id is required');
+  const ids = (xs) => xs.map((s) => `${s.name} (id ${s.id})`).join(', ');
+  const exact = list.filter((s) => s.name === r);
+  if (exact.length === 1) return exact[0];
+  if (exact.length > 1) throw usage(`script name "${r}" matches ${exact.length} library scripts: ${ids(exact)}; use the id`);
+  const ci = list.filter((s) => String(s.name ?? '').toLowerCase() === r.toLowerCase());
+  if (ci.length === 1) return ci[0];
+  if (ci.length > 1) throw usage(`script name "${r}" matches ${ci.length} library scripts (case-insensitive): ${ids(ci)}; use the exact name or the id`);
+  const byId = list.filter((s) => String(s.id) === r);
+  if (byId.length === 1) return byId[0];
+  throw cfgErr(`no library script named or with id "${r}". See: scripts list`);
+}
+
+// The body of POST /clients/{id}/scripts. is_sudo is always explicit (false unless --sudo).
+export function buildScriptRunBody(s, { isSudo = false, timeout, cwd } = {}) {
+  const body = { script: Buffer.from(String(s.script ?? ''), 'utf8').toString('base64') };
+  if (s.interpreter) body.interpreter = s.interpreter;
+  if (cwd) body.cwd = cwd;
+  body.is_sudo = !!isSudo;
+  body.timeout_sec = timeout;
+  return body;
+}
+
+export function checkBodySize(body, what) {
+  const bytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
+  if (bytes > LIMITS.SCRIPT_BODY_MAX_BYTES) {
+    throw guard(`${what}: the request body is ${bytes} bytes, above the server limit of ${LIMITS.SCRIPT_BODY_MAX_BYTES} bytes ([api] max_request_bytes; base64 adds about a third). Split the script into smaller ones, or ask the RPort admin to raise max_request_bytes.`);
+  }
+  return bytes;
+}
+
+// Clear explanations for the refusals RPort and the client send back on script calls.
+export function mapScriptApiError(e) {
+  if (!(e instanceof ApiError)) return e;
+  const first = e.message.split('\n')[0];
+  const msg = e.message.toLowerCase();
+  if (msg.includes('scope of the provided token')) {
+    return new CliError(EXIT.API, `${first}\n  hint: the API token has read-only scope. Running or changing scripts needs a read+write token; the operator creates one in RPort and updates the fleet secret.`);
+  }
+  if (e.status === 409 && /remote (scripts|commands)[^\n]*disabled/.test(msg)) {
+    return new CliError(EXIT.API, `REFUSED by the client: remote scripts are disabled on it.\n  (${first})\n  hint: running scripts needs both [remote-scripts] enabled = true and [remote-commands] enabled = true in the client's rport.conf, then a client restart. That is the operator's decision; do not work around it.`);
+  }
+  if (e.status === 409 && /still running/.test(msg)) {
+    return new CliError(EXIT.API, `REFUSED by the client: a previous command or script is still running on it.\n  (${first})\n  hint: wait, and check it with \`scripts jobs <client>\` / \`scripts job <client> <jid>\`. Do not start another run meanwhile.`);
+  }
+  if (e.status === 403) {
+    return new CliError(EXIT.API, `${first}\n  hint: the RPort user needs the \`scripts\` permission (user group) and access to that client; an RPort admin grants it.`);
+  }
+  return e;
+}
+
+async function scriptApi(ctx, conn, method, p, opts) {
+  try {
+    return await api(ctx, conn, method, p, opts);
+  } catch (e) {
+    throw mapScriptApiError(e);
+  }
+}
+
+async function listLibrary(ctx, conn) {
+  const all = [];
+  const page = 100;
+  for (let offset = 0; offset < page * 50; offset += page) {
+    const r = await scriptApi(ctx, conn, 'GET', LIB, { query: { 'page[limit]': page, 'page[offset]': offset } });
+    const list = Array.isArray(r.data) ? r.data : [];
+    all.push(...list);
+    if (list.length < page) break;
+  }
+  return all;
+}
+
+async function getLibraryScript(ctx, conn, ref) {
+  const hit = pickLibraryScript(await listLibrary(ctx, conn), ref);
+  const r = await scriptApi(ctx, conn, 'GET', `${LIB}/${encodeURIComponent(hit.id)}`, { hint404: `library script ${hit.id} vanished; run scripts list.` });
+  return r.data || hit;
+}
+
+async function getClient(ctx, conn, id) {
+  try {
+    return (await api(ctx, conn, 'GET', `/clients/${encodeURIComponent(id)}`)).data || null;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) return null;
+    throw e;
+  }
+}
+
+const libRow = (s) => ({ id: s.id, name: s.name, interpreter: s.interpreter || null, is_sudo: isOn(s.is_sudo), timeout_sec: s.timeout_sec ?? null, tags: Array.isArray(s.tags) ? s.tags : [], updated_at: s.updated_at || null });
+const jobPath = (clientId, jid) => `/clients/${encodeURIComponent(clientId)}/commands/${encodeURIComponent(jid)}`;
+const serverFlag = (a) => (a.f.server ? ` --server ${a.f.server}` : '');
+
+function readScriptFile(file) {
+  const p = path.resolve(String(file));
+  if (!fs.existsSync(p) || !fs.statSync(p).isFile()) throw cfgErr(`script file ${p} does not exist.`);
+  const text = fs.readFileSync(p, 'utf8');
+  if (!text.trim()) throw cfgErr(`script file ${p} is empty.`);
+  return text;
+}
+
+function parseTags(v) {
+  return String(v).split(',').map((t) => t.trim()).filter(Boolean);
+}
+
+function previewOf(text) {
+  const lines = scriptLines(text);
+  return { script_sha256: scriptSha256(text), script_bytes: Buffer.byteLength(String(text), 'utf8'), script_lines: lines.length, preview: lines.slice(0, LIMITS.SCRIPT_PREVIEW_LINES) };
+}
+
+// Dry-run plans of library writes: the script text is shown as hash + first lines, not inline.
+function printScriptPlans(ctx, text) {
+  for (const p of ctx.plans) {
+    const b = p.body && p.body.script !== undefined ? { ...p.body, script: `<${Buffer.byteLength(String(text), 'utf8')} bytes, sha256 ${scriptSha256(text)}>` } : p.body;
+    out(`DRY-RUN would call: ${p.method} ${p.url}  Authorization: Basic [REDACTED]${b ? '  body: ' + JSON.stringify(b) : ''}`);
+  }
+  if (text !== undefined) {
+    const pv = previewOf(text);
+    out(`script sha256 ${pv.script_sha256}, ${pv.script_lines} lines, ${pv.script_bytes} bytes; first lines:`);
+    for (const l of pv.preview) out(`  | ${l}`);
+  }
+}
+
+function writeJobFile(job, outFile, jid) {
+  let p;
+  if (outFile) {
+    p = path.resolve(String(outFile));
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+  } else {
+    ensureStateDir();
+    const d = path.join(stateDir(), 'jobs');
+    fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+    p = path.join(d, `${String(jid).replace(/[^A-Za-z0-9._-]/g, '_')}.json`);
+  }
+  fs.writeFileSync(p, redact(JSON.stringify(job ?? { jid, status: 'running', note: 'job not visible on the server yet' }, null, 2)) + '\n', { mode: 0o600 });
+  return p;
+}
+
+// Summary of a job: status, timing, error, output tails (never the full output).
+export function jobSummary(job, { jid, clientId, timeout } = {}) {
+  const j = job || {};
+  const res = j.result || {};
+  const status = j.status || 'running';
+  const s = {
+    jid: j.jid || jid, client_id: j.client_id || clientId, client_name: j.client_name || null, status,
+    exit_code: j.exit_code ?? res.exit_code ?? null,
+    interpreter: j.interpreter || null, cwd: j.cwd || null, is_sudo: j.is_sudo ?? null, timeout_sec: j.timeout_sec ?? timeout ?? null,
+    started_at: j.started_at || null, finished_at: j.finished_at || null, created_by: j.created_by || null,
+    error: j.error || null, summary: res.summary || null,
+    stdout_tail: tailLines(res.stdout), stderr_tail: tailLines(res.stderr),
+  };
+  if (status === 'unknown') {
+    s.note = `the server stopped observing after timeout_sec=${s.timeout_sec}s, so the status is unknown: the process may still be running on the client. RPort cannot cancel it. Do not re-run blindly; check the client later.`;
+  }
+  return s;
+}
+
+function printJob(ctx, result) {
+  if (!ctx.json) {
+    out(`job ${result.jid} on client ${result.client_id}${result.client_name ? ' (' + result.client_name + ')' : ''}: ${result.status}${result.exit_code !== null ? ', exit code ' + result.exit_code : ''}`);
+    if (result.started_at) out(`started ${fmtTime(result.started_at)}${result.finished_at ? ', finished ' + fmtTime(result.finished_at) : ''}`);
+    if (result.error) out(`error: ${result.error}`);
+    if (result.summary) out(`summary: ${result.summary}`);
+    if (result.stdout_tail) out(`--- stdout (last ${LIMITS.SCRIPT_TAIL_LINES} lines) ---\n${result.stdout_tail}`);
+    if (result.stderr_tail) out(`--- stderr (last ${LIMITS.SCRIPT_TAIL_LINES} lines) ---\n${result.stderr_tail}`);
+    if (result.note) out(`NOTE: ${result.note}`);
+    if (result.output_file) out(`full job JSON: ${result.output_file}`);
+  }
+  out(`RESULT ${JSON.stringify(result)}`);
+}
+
+async function cmdScriptsRun(ctx, a, conn) {
+  if (a._.length !== 3) throw usage('scripts run <script> --client <client>: exactly one library script per run');
+  if (!a.f.client) throw usage('scripts run needs --client <id|name> (one client per run)');
+  const clientId = await resolveClient(ctx, conn, a.f.client);
+  const client = await getClient(ctx, conn, clientId);
+  if (!client || client.connection_state === 'disconnected') {
+    throw guard(`client ${a.f.client} (${clientId}) is not connected. RPort runs scripts only on connected clients; check it with: clients --name <name>.`);
+  }
+  const s = await getLibraryScript(ctx, conn, a._[2]);
+  if (typeof s.script !== 'string' || !s.script.trim()) throw cfgErr(`library script ${s.name} (id ${s.id}) has no script text.`);
+  if (isOn(s.is_sudo) && !a.f.sudo) {
+    throw guard(`library script "${s.name}" is stored with is_sudo=true: it requires elevation. Elevation is used only when the operator explicitly asks for it for this run; ask them, then pass --sudo.`);
+  }
+  const isSudo = !!a.f.sudo;
+  const timeout = validateScriptTimeout(a.f.timeout, s.timeout_sec);
+  const cwd = a.f.cwd !== undefined ? a.f.cwd : (s.cwd || undefined);
+  const body = buildScriptRunBody(s, { isSudo, timeout, cwd });
+  checkBodySize(body, `script "${s.name}"`);
+  const wait = a.f.wait !== undefined ? wholeNumber(a.f.wait, '--wait') : timeout + LIMITS.SCRIPT_WAIT_EXTRA;
+  const sha = scriptSha256(s.script);
+  const runPath = `/clients/${encodeURIComponent(clientId)}/scripts`;
+
+  if (ctx.dryRun) {
+    const url = displayUrl(new URL(conn.base + runPath));
+    const pv = previewOf(s.script);
+    out(`DRY-RUN would call: POST ${url}  Authorization: Basic [REDACTED]  body: ${JSON.stringify({ ...body, script: `<base64 of ${pv.script_bytes} bytes>` })}`);
+    const plan = {
+      client_id: clientId, client_name: client.name || null, script_id: s.id, script_name: s.name,
+      interpreter: s.interpreter || null, cwd: cwd || null, is_sudo: isSudo, timeout_sec: timeout, wait_sec: wait,
+      script_sha256: pv.script_sha256, script_lines: pv.script_lines, script_preview: pv.preview, method: 'POST', url,
+    };
+    out(`PLAN ${JSON.stringify(plan)}`);
+    if (!ctx.json) {
+      out(`script ${s.name} (id ${s.id}) sha256 ${pv.script_sha256}, ${pv.script_lines} lines; first lines:`);
+      for (const l of pv.preview) out(`  | ${l}`);
+    }
+    return;
+  }
+
+  const r = await scriptApi(ctx, conn, 'POST', runPath, {
+    body, write: true,
+    hint404: `client ${a.f.client} is not active (disconnected or paused): RPort answers "Active client with id=... not found". Check it with: clients --name <name>.`,
+  });
+  const jid = r.data && r.data.jid;
+  if (!jid) throw new CliError(EXIT.API, 'API: the run reply had no jid.');
+
+  // Poll until the job leaves "running" or --wait elapses.
+  const deadline = Date.now() + wait * 1000;
+  let job = null;
+  for (;;) {
+    try {
+      job = (await scriptApi(ctx, conn, 'GET', jobPath(clientId, jid))).data || job;
+    } catch (e) {
+      if (!(e instanceof ApiError && e.status === 404)) throw e; // not visible yet: keep polling
+    }
+    if (job && job.status && job.status !== 'running') break;
+    const left = deadline - Date.now();
+    if (left <= 0) break;
+    await sleep(Math.min(pollMs(), left));
+  }
+
+  const result = { ...jobSummary(job, { jid, clientId, timeout }), script_id: s.id, script_name: s.name, script_sha256: sha, server: conn.name };
+  if (result.status === 'running') {
+    result.note = `still running after --wait ${wait}s. Check it later with: scripts job ${clientId} ${jid}${serverFlag(a)}`;
+  }
+  result.output_file = writeJobFile(job, a.f.out, jid);
+  const at = new Date().toISOString();
+  appendLedger({
+    ...makeRecord({ action: 'script-run', server: conn.name, client_id: clientId, client: a.f.client, script_id: String(s.id), script_name: s.name, sha256: sha, is_sudo: isSudo, timeout_sec: timeout, jid: String(jid), status: result.status }),
+    at, ts: at,
+  });
+  printJob(ctx, result);
+}
+
+async function cmdScripts(ctx, a) {
+  const sub = a._[1] || 'list';
+  const conn = connFor(ctx.cfg, a.f.server);
+  if (sub === 'list') {
+    let list = (await listLibrary(ctx, conn)).map(libRow);
+    if (a.f.query) list = list.filter((s) => String(s.name ?? '').toLowerCase().includes(String(a.f.query).toLowerCase()));
+    if (ctx.json) return out(JSON.stringify(list));
+    if (!list.length) return out('no library scripts matched');
+    for (const s of list) out(`${s.id}  ${s.name}  interpreter=${s.interpreter || '(server default)'}  sudo=${s.is_sudo}  timeout=${s.timeout_sec ?? '-'}s  tags=${s.tags.join(',') || '-'}  updated=${s.updated_at || '-'}`);
+    return;
+  }
+  if (sub === 'show') {
+    const s = await getLibraryScript(ctx, conn, a._[2]);
+    return out(JSON.stringify({ ...s, script_sha256: scriptSha256(s.script ?? '') }, null, ctx.json ? 0 : 2));
+  }
+  if (sub === 'run') return cmdScriptsRun(ctx, a, conn);
+  if (sub === 'job') {
+    const [ref, jid] = [a._[2], a._[3]];
+    if (!ref || !jid) throw usage('scripts job <client> <jid>');
+    const clientId = await resolveClient(ctx, conn, ref);
+    const job = (await scriptApi(ctx, conn, 'GET', jobPath(clientId, jid), { hint404: `no job ${jid} on client ${clientId}; list them with: scripts jobs ${ref}` })).data;
+    const result = jobSummary(job, { jid, clientId });
+    result.output_file = writeJobFile(job, a.f.out, jid);
+    return printJob(ctx, result);
+  }
+  if (sub === 'jobs') {
+    const ref = a._[2];
+    if (!ref) throw usage('scripts jobs <client> [--limit N]');
+    const limit = a.f.limit !== undefined ? wholeNumber(a.f.limit, '--limit') : 20;
+    if (limit < 1) throw usage('--limit must be at least 1');
+    const clientId = await resolveClient(ctx, conn, ref);
+    const r = await scriptApi(ctx, conn, 'GET', `/clients/${encodeURIComponent(clientId)}/commands`, { query: { 'page[limit]': limit } });
+    const rows = (Array.isArray(r.data) ? r.data : [])
+      .map((j) => ({ jid: j.jid, status: j.status, started_at: j.started_at || null, finished_at: j.finished_at || null, created_by: j.created_by || null, interpreter: j.interpreter || null, is_sudo: j.is_sudo ?? null, timeout_sec: j.timeout_sec ?? null, error: j.error || null, summary: (j.result && j.result.summary) || null }))
+      .sort((x, y) => String(y.started_at || '').localeCompare(String(x.started_at || '')))
+      .slice(0, limit);
+    if (ctx.json) return out(JSON.stringify(rows));
+    if (!rows.length) return out(`no jobs on client ${clientId}`);
+    for (const j of rows) out(`${j.jid}  ${j.status}  started=${j.started_at || '-'}  finished=${j.finished_at || '-'}  by=${j.created_by || '-'}  sudo=${j.is_sudo}${j.error ? '  error=' + j.error : ''}`);
+    return;
+  }
+  if (sub === 'add') {
+    const name = a._[2];
+    if (!name || a._.length !== 3) throw usage('scripts add <name> --file <path>');
+    if (!a.f.file) throw usage('scripts add needs --file <path>: script text comes only from a local file');
+    const text = readScriptFile(a.f.file);
+    const body = { name, script: text };
+    if (a.f.interpreter) body.interpreter = a.f.interpreter;
+    if (a.f.cwd) body.cwd = a.f.cwd;
+    body.is_sudo = !!a.f.sudo;
+    if (a.f.timeout !== undefined) body.timeout_sec = validateScriptTimeout(a.f.timeout);
+    if (a.f.tags !== undefined) body.tags = parseTags(a.f.tags);
+    checkBodySize(body, `library script "${name}"`);
+    if ((await listLibrary(ctx, conn)).some((s) => s.name === name)) throw cfgErr(`the library already has a script named "${name}". Use scripts update.`);
+    const r = await scriptApi(ctx, conn, 'POST', LIB, { body, write: true });
+    if (ctx.dryRun) { out(`DRY-RUN (${ADMIN_NOTE})`); return printScriptPlans(ctx, text); }
+    const saved = r.data || {};
+    if (ctx.json) return out(JSON.stringify(libRow(saved)));
+    return out(`added library script ${name} (id ${saved.id}), sha256 ${scriptSha256(text)} [${ADMIN_NOTE}]`);
+  }
+  if (sub === 'update') {
+    if (a.f.sudo && a.f['no-sudo']) throw usage('pass --sudo or --no-sudo, not both');
+    const s = await getLibraryScript(ctx, conn, a._[2]);
+    const next = { name: s.name, script: s.script, interpreter: s.interpreter || '', cwd: s.cwd || '', is_sudo: isOn(s.is_sudo), timeout_sec: s.timeout_sec ?? LIMITS.SCRIPT_TIMEOUT_DEFAULT, tags: Array.isArray(s.tags) ? s.tags : [] };
+    const changed = [];
+    const set = (k, v) => { if (JSON.stringify(next[k]) !== JSON.stringify(v)) { next[k] = v; changed.push(k); } };
+    if (a.f.file !== undefined) set('script', readScriptFile(a.f.file));
+    if (a.f.name !== undefined) set('name', a.f.name);
+    if (a.f.interpreter !== undefined) set('interpreter', a.f.interpreter);
+    if (a.f.cwd !== undefined) set('cwd', a.f.cwd);
+    if (a.f.sudo) set('is_sudo', true);
+    if (a.f['no-sudo']) set('is_sudo', false);
+    if (a.f.timeout !== undefined) set('timeout_sec', validateScriptTimeout(a.f.timeout));
+    if (a.f.tags !== undefined) set('tags', parseTags(a.f.tags));
+    if (!changed.length) throw usage('scripts update: nothing to change (give --file, --name, --interpreter, --cwd, --sudo/--no-sudo, --timeout or --tags)');
+    if (changed.includes('name') && (await listLibrary(ctx, conn)).some((x) => x.name === next.name && String(x.id) !== String(s.id))) {
+      throw cfgErr(`the library already has another script named "${next.name}".`);
+    }
+    checkBodySize(next, `library script "${next.name}"`);
+    // Full object sent back (no partial updates).
+    await scriptApi(ctx, conn, 'PUT', `${LIB}/${encodeURIComponent(s.id)}`, { body: next, write: true });
+    if (ctx.dryRun) {
+      out(`DRY-RUN (${ADMIN_NOTE}) changes: ${changed.join(', ')}`);
+      return printScriptPlans(ctx, next.script);
+    }
+    if (ctx.json) return out(JSON.stringify({ id: s.id, name: next.name, changed, script_sha256: scriptSha256(next.script) }));
+    return out(`updated library script ${next.name} (id ${s.id}): ${changed.join(', ')}; sha256 ${scriptSha256(next.script)} [${ADMIN_NOTE}]`);
+  }
+  if (sub === 'delete') {
+    const s = await getLibraryScript(ctx, conn, a._[2]);
+    await scriptApi(ctx, conn, 'DELETE', `${LIB}/${encodeURIComponent(s.id)}`, { write: true });
+    if (ctx.dryRun) { out(`DRY-RUN (${ADMIN_NOTE})`); return printScriptPlans(ctx); }
+    if (ctx.json) return out(JSON.stringify({ id: s.id, name: s.name, deleted: true }));
+    return out(`deleted library script ${s.name} (id ${s.id}) [${ADMIN_NOTE}]`);
+  }
+  throw usage(`unknown scripts subcommand "${sub}"`);
 }
 
 export const HELP = `rport.mjs - RPort helper for the rport agent skill (Node >= 18)
@@ -1083,6 +1485,19 @@ Admin changes on the server (only on the operator's explicit request; --dry-run 
   def set-options <name> --client X [--idle N] [--auto-close D] [--protocol P]
           drops skip-idle-timeout / check_port=0, keeps other stored keys
   def remove <name> --client X
+Scripts (only library scripts, one client per run; <script> = name, case-insensitive name or id):
+  scripts list [--query TEXT]          library entries, no script bodies
+  scripts show <script>                one entry with its script text and sha256
+  scripts run <script> --client X [--sudo] [--timeout SEC] [--cwd DIR] [--wait SEC] [--out FILE]
+                                       run it on one connected client, poll the job, print RESULT {...}
+                                       (status, output tails); full job JSON to --out or <state>/jobs/<jid>.json
+  scripts job <client> <jid> [--out FILE]   one job: status, error, output tails, full file
+  scripts jobs <client> [--limit N]    recent jobs on that client
+Script library admin changes (only on the operator's explicit request; --dry-run first):
+  scripts add <name> --file <path> [--interpreter I] [--cwd D] [--sudo] [--timeout SEC] [--tags a,b]
+  scripts update <script> [--file <path>] [--name N] [--interpreter I] [--cwd D] [--sudo|--no-sudo]
+          [--timeout SEC] [--tags a,b]
+  scripts delete <script>
 Local config:
   server list | show [<moniker>] | remove <moniker>
   server add [<moniker>] --url https://host --user U [--token-secret S] [--runner-member M]
@@ -1098,13 +1513,23 @@ never skip-idle-timeout; ACL never empty / 0.0.0.0/0 / wider than /30, max 4 ent
 IPv4 only; "self" is resolved via GET /me/ip and stored as a /32; revive uses exactly
 the stored ACL and refuses if your IP is not in it; check_port always on; LAN targets
 need --allow-lan-target; http_proxy needs auth; no force-close unless asked.
+Scripts: no ad-hoc commands or scripts, no multi-client/group/websocket runs; script
+text only from the library (and into it only from a file); is_sudo only with --sudo
+for that run (a library script marked is_sudo is refused without it); timeout default
+library or 60s, max 3600s; request body max 10240 bytes; status "unknown" means the
+server stopped watching and the process may still run (no cancel exists).
 
 Exit codes: 0 ok, 1 usage, 2 guardrail refusal, 3 API error, 4 config error.
-State: ~/.config/rport-skill/ (config.json, ledger.jsonl); override with RPORT_SKILL_HOME.`;
+State: ~/.config/rport-skill/ (config.json, ledger.jsonl, jobs/); override with RPORT_SKILL_HOME.`;
 
-const BOOL_FLAGS = new Set(['json', 'dry-run', 'force', 'allow-lan-target', 'debug', 'replace', 'http-proxy', 'help']);
-const VALUE_FLAGS = new Set(['server', 'client', 'remote', 'acl', 'idle', 'auto-close', 'scheme', 'protocol', 'public-port', 'fleet-member', 'name', 'def', 'since', 'tunnel', 'url', 'user', 'token-secret', 'runner-member', 'auth-user', 'host-header']);
+const BOOL_FLAGS = new Set(['json', 'dry-run', 'force', 'allow-lan-target', 'debug', 'replace', 'http-proxy', 'help', 'sudo', 'no-sudo']);
+const VALUE_FLAGS = new Set(['server', 'client', 'remote', 'acl', 'idle', 'auto-close', 'scheme', 'protocol', 'public-port', 'fleet-member', 'name', 'def', 'since', 'tunnel', 'url', 'user', 'token-secret', 'runner-member', 'auth-user', 'host-header',
+  'query', 'timeout', 'cwd', 'wait', 'out', 'file', 'interpreter', 'tags', 'limit']);
 const FORBIDDEN_FLAGS = {
+  script: 'script text is never passed on the command line: run a library script (scripts run), or add one from a file (scripts add --file).',
+  command: 'ad-hoc commands are never run: only a script from the server\'s library runs (scripts run).',
+  clients: 'one client per run: no multi-client script runs.',
+  group: 'one client per run: no client-group script runs.',
   'skip-idle-timeout': 'skip-idle-timeout is never allowed: every tunnel must close when idle.',
   'check-port': 'check_port always stays on.',
   check_port: 'check_port always stays on.',
@@ -1146,6 +1571,7 @@ export async function main(argv) {
     const table = {
       ip: cmdIp, whoami: cmdWhoami, clients: cmdClients, tunnels: cmdTunnels,
       server: cmdServer, runner: cmdRunner, def: cmdDef, link: cmdLink, status: cmdStatus, revive: cmdRevive, close: cmdClose, ledger: cmdLedger,
+      scripts: cmdScripts,
     };
     const fn = table[cmd];
     if (!fn) throw usage(`unknown command "${cmd}"`);
