@@ -27,8 +27,8 @@
     {
       "name": "rport",
       "source": "./plugins/rport",
-      "description": "Guardrails for RPort servers (rportd/openrport): stored tunnels, revive, expiry, repointing fleet members, and running reviewed library scripts on one client; the API token stays in apra-fleet. Requires apra-fleet 0.4.4+ and Node.js 18+.",
-      "version": "0.3.0",
+      "description": "Guardrails for RPort servers (rportd/openrport): stored tunnels, revive, expiry, repointing fleet members, running reviewed library scripts on one client, and explaining script run history (who, what, when, effects); the API token stays in apra-fleet. Requires apra-fleet 0.4.4+ and Node.js 18+.",
+      "version": "0.4.0",
       "category": "devops",
       "keywords": [
         "rport",

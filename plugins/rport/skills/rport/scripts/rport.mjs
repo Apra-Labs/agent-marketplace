@@ -489,7 +489,7 @@ async function api(ctx, conn, method, p, { query, body, write = false, hint404 }
     const detail = [e0.title, e0.detail].filter(Boolean).join(': ') || text.slice(0, 200);
     throw new ApiError(res.status, e0.code, detail, `${method} ${new URL(shown).pathname}`, res.status === 404 ? hint404 : undefined);
   }
-  return { status: res.status, data: json && Object.prototype.hasOwnProperty.call(json, 'data') ? json.data : json };
+  return { status: res.status, data: json && Object.prototype.hasOwnProperty.call(json, 'data') ? json.data : json, meta: (json && json.meta) || null };
 }
 
 async function getSelfIp(ctx, conn) {
@@ -1276,6 +1276,12 @@ function printJob(ctx, result) {
     if (result.stdout_tail) out(`--- stdout (last ${LIMITS.SCRIPT_TAIL_LINES} lines) ---\n${result.stdout_tail}`);
     if (result.stderr_tail) out(`--- stderr (last ${LIMITS.SCRIPT_TAIL_LINES} lines) ---\n${result.stderr_tail}`);
     if (result.note) out(`NOTE: ${result.note}`);
+    const h = result.history;
+    if (h) {
+      out(`what: ${h.kind} ${h.attribution}, sha256 ${String(h.sha256).slice(0, 12)}, ${h.line_count} lines; interpreter ${h.interpreter_resolved}; sudo=${h.is_sudo}; by ${h.created_by || '?'}${h.remote_ip ? ' from ' + h.remote_ip : ''}`);
+      if (h.started_utc) out(`started ${h.started_utc} UTC (client clock: ${h.started_local})${h.duration_s !== null ? ', ' + h.duration_s + 's' : ''}`);
+      for (const f of h.flags) out(`FLAG ${f.code}: ${f.text}`);
+    }
     if (result.output_file) out(`full job JSON: ${result.output_file}`);
   }
   out(`RESULT ${JSON.stringify(result)}`);
@@ -1355,6 +1361,669 @@ async function cmdScriptsRun(ctx, a, conn) {
   printJob(ctx, result);
 }
 
+// ---------------------------------------------------------------------------
+// Script run history (READ-ONLY). Answers: which script ran, by whom, when, from where, on which
+// client, with what privileges and what it produced - by joining per-client jobs, multi-client
+// jobs, the script library (+ its audited versions) and the audit log. Only GET requests, ever;
+// nothing is executed to find out.
+// ---------------------------------------------------------------------------
+const MULTI_JOBS = '/commands'; // multi-client jobs: read with GET only (history), never written
+const AUDIT = '/auditlog';
+const CLIENT_FIELDS = 'id,name,connection_state,disconnected_at,os_kernel';
+export const HISTORY = Object.freeze({
+  LIMIT_DEFAULT: 200,
+  TAIL_LINES: 15,
+  PREVIEW_LINES: 20,
+  CONCURRENCY: 4,
+  AUDIT_MATCH_MS: 2 * 60000, // audit execute.start vs job started_at
+  EDIT_WINDOW_MS: 30 * 60000, // RAN_SOON_AFTER_LIBRARY_EDIT
+  LARGE_OUTPUT_BYTES: 64 * 1024,
+  MAX_PAGES: 50,
+  STALE_GRACE_MS: 10 * 60000, // running past started + timeout_sec + this = STALE_RUNNING
+  CACHE_VERSION: 2,
+});
+// Every flag a run record can carry, with its meaning (summary.flag_legend, report Attention).
+export const FLAG_CODES = Object.freeze({
+  INTERPRETER_OS_MISMATCH: 'script syntax does not fit the interpreter/OS it ran with',
+  SUDO: 'ran with elevated privileges (is_sudo)',
+  INLINE_SUDO: 'runs commands with sudo inside the script/command; elevation came from the client\'s sudo rules, not RPort\'s is_sudo',
+  NOT_FROM_LIBRARY: 'text matches no library script or audited library version',
+  LIBRARY_VERSION_OUTDATED: 'matches an older library version',
+  RAN_SOON_AFTER_LIBRARY_EDIT: 'started within 30 min of an edit of that library script',
+  UNKNOWN_MAY_STILL_RUN: 'status unknown: the server stopped observing; the process may still be running',
+  STILL_RUNNING: 'job still running (recent)',
+  STALE_RUNNING: 'status never finalised - the client probably disconnected, rebooted or lost the job; the process may or may not have run to completion',
+  FAILED: 'job failed',
+  NO_AUDIT_RECORD: 'no matching audit log entry (who/from where unverified)',
+  MULTI_CLIENT: 'part of a multi-client job with more than one target',
+  SCHEDULED: 'started by a schedule',
+  EMPTY_CLIENT_NAME: 'the job has an empty client_name',
+  OUTPUT_TRUNCATED_OR_LARGE: 'output large or truncated; only tails shown',
+});
+
+// sudo used as a command word (start of line, after ; & | ( or whitespace), outside # comment lines.
+export function hasInlineSudo(text) {
+  return normalizeScriptText(text).split('\n').some((l) => !/^\s*#/.test(l) && /(^|[;&|(\s])sudo(\s|$)/.test(l));
+}
+const NOT_FINAL = new Set(['running', 'unknown', '']);
+
+// Likely secrets in script text and output. Applied before anything is printed or written.
+const SECRET_PATTERNS = [
+  [/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|$)/g, '[REDACTED]'],
+  [/\b(Authorization\s*:\s*)[^\r\n"']*/gi, '$1[REDACTED]'],
+  [/\b(Bearer\s+)[A-Za-z0-9._~+/=-]{6,}/g, '$1[REDACTED]'],
+  [/\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g, '[REDACTED]'],
+  [/\b([A-Za-z0-9_]*(?:PASS|PWD|TOKEN|SECRET|KEY)[A-Za-z0-9_]*)(\s*=\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s;&|]+)/gi, '$1$2[REDACTED]'],
+  [/\b(password|passwd|pwd|token|secret|api[_-]?key)(\s*[:=]\s*)("[^"\r\n]*"|'[^'\r\n]*'|[^\s;&|,]+)/gi, '$1$2[REDACTED]'],
+];
+export function redactSecrets(text) {
+  let s = String(text ?? '');
+  for (const [re, rep] of SECRET_PATTERNS) s = s.replace(re, rep);
+  return s;
+}
+
+// Hash key for attribution: CRLF -> LF, trailing whitespace per line and trailing newlines dropped.
+export function normalizeScriptText(t) {
+  return String(t ?? '').replace(/\r\n?/g, '\n').split('\n').map((l) => l.replace(/[ \t\f\v]+$/, '')).join('\n').replace(/\n+$/, '');
+}
+export const normScriptSha256 = (t) => scriptSha256(normalizeScriptText(t));
+
+// RPort timestamps carry the client's offset ("...+05:30"); normalise to UTC ISO. Zero time -> null.
+export function toUtcIso(s) {
+  if (s === undefined || s === null || s === '') return null;
+  const t = Date.parse(String(s));
+  if (Number.isNaN(t) || t < Date.UTC(1971, 0, 1)) return null;
+  return new Date(t).toISOString();
+}
+
+// --since/--until: ISO time, or a relative age (7d, 24h, 30m, 1h30m) counted back from now.
+export function parseWhen(v, now = Date.now(), what = '--since') {
+  const s = String(v ?? '').trim();
+  const d = /^(\d+)d$/i.exec(s);
+  if (d) return now - Number(d[1]) * 86400000;
+  if (s && /^(?:\d+h)?(?:\d+m)?(?:\d+s)?$/.test(s)) return now - parseDuration(s) * 1000;
+  if (/^\d{4}-\d{2}-\d{2}/.test(s)) {
+    const t = Date.parse(s);
+    if (!Number.isNaN(t)) return t;
+  }
+  throw usage(`${what} "${s}" must be an ISO time (2026-10-30T10:00:00Z) or a relative age like 7d, 24h, 30m`);
+}
+
+const POSIX_HINTS = [
+  [/^#!\S*\/(?:env\s+)?(?:ba|z|da|k)?sh\b/m, 'shebang'], [/^#!\S*\/env\s+(?:ba|z|da|k)?sh\b/m, 'shebang'],
+  [/\$\(/, '$(...)'], [/(^|[\s;&|(])sudo\s/m, 'sudo'], [/(^|[\s;&|(])docker\s/m, 'docker'],
+  [/^\s*export\s+[A-Za-z_]\w*=/m, 'export'], [/^\s*(?:fi|done|esac)\s*$/m, 'fi/done/esac'], [/\[\[ /, '[[ ]]'],
+];
+const WINDOWS_HINTS = [
+  [/^\s*@?echo\s+off\b/im, 'echo off'], [/%[A-Za-z_]\w*%/, '%VAR%'], [/\$env:/i, '$env:'],
+  [/\b(?:Get|Set|New|Remove|Start|Stop|Write|Invoke|Test)-[A-Z][A-Za-z]+/, 'PowerShell cmdlet'], [/^\s*rem\s/im, 'REM'],
+];
+// Which shell family the text looks written for (heuristic, on the raw text).
+export function scriptFlavor(text) {
+  const t = String(text ?? '');
+  const hits = (list) => [...new Set(list.filter(([re]) => re.test(t)).map(([, n]) => n))];
+  return { posix: hits(POSIX_HINTS), windows: hits(WINDOWS_HINTS) };
+}
+
+export function clientOsFamily(c) {
+  const s = [c && c.os_kernel, c && c.os_family, c && c.os, c && c.os_full_name].filter(Boolean).join(' ').toLowerCase();
+  if (!s) return null;
+  return /windows/.test(s) ? 'windows' : 'unix';
+}
+
+// interpreter "" = the server default: cmd on Windows, /bin/sh on Unix.
+export function resolveInterpreter(interp, osFamily) {
+  const i = String(interp ?? '').trim();
+  if (i) {
+    let kind = 'other';
+    if (/(^|[\\/])cmd(\.exe)?$/i.test(i)) kind = 'cmd';
+    else if (/powershell|pwsh/i.test(i)) kind = 'powershell';
+    else if (/(^|[\\/])(?:ba|z|da|k)?sh(\.exe)?$/i.test(i) || /bash/i.test(i)) kind = 'posix';
+    return { resolved: i, server_default: false, kind };
+  }
+  if (osFamily === 'windows') return { resolved: 'cmd (server default, Windows)', server_default: true, kind: 'cmd' };
+  if (osFamily === 'unix') return { resolved: '/bin/sh (server default, Unix)', server_default: true, kind: 'posix' };
+  return { resolved: '(server default; client OS unknown)', server_default: true, kind: 'unknown' };
+}
+
+const parseLoose = (v) => {
+  if (v && typeof v === 'object') return v;
+  if (typeof v !== 'string' || !v.trim()) return null;
+  try { return JSON.parse(v); } catch { return null; }
+};
+function maybeBase64(v) {
+  const s = String(v).replace(/\s+/g, '');
+  if (s.length < 8 || s.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(s)) return null;
+  const dec = Buffer.from(s, 'base64').toString('utf8');
+  return dec.includes(String.fromCharCode(0xfffd)) || /[\u0000-\u0008\u000E-\u001F]/.test(dec) ? null : dec;
+}
+const byteLen = (s) => Buffer.byteLength(String(s ?? ''), 'utf8');
+
+// The cacheable, secret-free form of a job detail: hashes and heuristics from the raw text,
+// only redacted previews/tails of text and output are kept.
+export function slimJob(job) {
+  const j = job || {};
+  const res = j.result || {};
+  const text = String(j.command ?? '');
+  const lines = scriptLines(text);
+  const redLines = scriptLines(redactSecrets(text));
+  const stdout = String(res.stdout ?? '');
+  const stderr = String(res.stderr ?? '');
+  return {
+    _v: HISTORY.CACHE_VERSION,
+    jid: j.jid != null ? String(j.jid) : null, status: j.status || '', client_id: j.client_id != null ? String(j.client_id) : null,
+    client_name: j.client_name ?? null, started_at: j.started_at || null, finished_at: j.finished_at || null,
+    created_by: j.created_by || null, timeout_sec: j.timeout_sec ?? null, multi_job_id: j.multi_job_id || null, schedule_id: j.schedule_id || null,
+    error: j.error || null, is_sudo: isOn(j.is_sudo), is_script: isOn(j.is_script), interpreter: j.interpreter ?? '', cwd: j.cwd || null, pid: j.pid ?? null,
+    summary: res.summary ? redactSecrets(res.summary) : null,
+    command_sha256: scriptSha256(text), command_norm_sha256: normScriptSha256(text), command_lines: lines.length, command_bytes: byteLen(text),
+    command_first_line: (redLines.find((l) => l.trim()) || '').trim().slice(0, 160),
+    command_preview: redLines.slice(0, HISTORY.PREVIEW_LINES).join('\n'),
+    flavor: scriptFlavor(text), inline_sudo: hasInlineSudo(text),
+    stdout_tail: redactSecrets(tailLines(stdout, HISTORY.TAIL_LINES)), stderr_tail: redactSecrets(tailLines(stderr, HISTORY.TAIL_LINES)),
+    stdout_bytes: byteLen(stdout), stderr_bytes: byteLen(stderr),
+    output_truncated: /\btruncated\b/i.test(`${res.summary || ''}\n${stdout.slice(-400)}\n${stderr.slice(-400)}`),
+  };
+}
+
+// Library scripts with their versions: audited create/update texts (oldest first) plus the
+// library's current text (newest). Versions are numbered 1..n; edits = updates with time + user.
+export function buildLibraryIndex(library = [], libAudit = []) {
+  const scripts = new Map();
+  const get = (id, name) => {
+    const k = String(id);
+    if (!scripts.has(k)) scripts.set(k, { id: k, name: name ?? null, in_library: false, deleted: false, versions: [], edits: [] });
+    return scripts.get(k);
+  };
+  const entries = libAudit.map((e) => ({ e, t: Date.parse(e.timestamp) })).filter((x) => !Number.isNaN(x.t)).sort((x, y) => x.t - y.t);
+  for (const { e, t } of entries) {
+    const action = String(e.action || '').toLowerCase();
+    const req = parseLoose(e.request) || {};
+    const resp0 = parseLoose(e.response) || {};
+    const resp = resp0.data && typeof resp0.data === 'object' ? resp0.data : resp0;
+    const id = resp.id ?? e.affected_id ?? req.id;
+    if (id === undefined || id === null || id === '') continue;
+    const s = get(id, req.name || resp.name);
+    if (req.name) s.name = req.name;
+    const at = new Date(t).toISOString();
+    if (/delete/.test(action)) { s.deleted = true; s.deleted_at = at; continue; }
+    if (/update/.test(action)) s.edits.push({ at, by: e.username || resp.updated_by || null });
+    if (typeof req.script === 'string') s.versions.push({ sha: normScriptSha256(req.script), at, by: e.username || null, source: `audit ${action}` });
+  }
+  for (const l of library) {
+    const s = get(l.id, l.name);
+    Object.assign(s, { name: l.name, in_library: true, deleted: false });
+    const created = toUtcIso(l.created_at);
+    const at = toUtcIso(l.updated_at) || created;
+    const sha = normScriptSha256(l.script ?? '');
+    const last = s.versions[s.versions.length - 1];
+    if (last && last.sha === sha) last.current = true;
+    else s.versions.push({ sha, at, by: l.updated_by || l.created_by || null, source: 'library', current: true });
+    if (at && created && at !== created && !s.edits.some((x) => Math.abs(Date.parse(x.at) - Date.parse(at)) < 5000)) s.edits.push({ at, by: l.updated_by || null });
+  }
+  for (const s of scripts.values()) {
+    const v = [];
+    for (const x of s.versions) {
+      if (v.length && v[v.length - 1].sha === x.sha) { if (x.current) v[v.length - 1].current = true; continue; }
+      v.push(x);
+    }
+    v.forEach((x, i) => { x.index = i + 1; });
+    s.versions = v;
+  }
+  return scripts;
+}
+
+// Which library script (and version) a job text is. Prefers a version that existed before the run.
+export function attributeScript(normSha, startedMs, index) {
+  const hits = [];
+  for (const s of index.values()) for (const v of s.versions) if (v.sha === normSha) hits.push({ s, v });
+  if (!hits.length) return null;
+  const score = ({ s, v }) => {
+    const t = Date.parse(v.at);
+    return [!Number.isNaN(t) && !Number.isNaN(startedMs) && t <= startedMs + 60000 ? 1 : 0, s.in_library ? 1 : 0, v.current ? 1 : 0, Number.isNaN(t) ? 0 : t];
+  };
+  const cmp = (x, y) => { for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return x[i] - y[i]; return 0; };
+  hits.sort((x, y) => cmp(score(y), score(x)));
+  const { s, v } = hits[0];
+  return {
+    library_id: s.id, library_name: s.name, version: v.index, versions_total: s.versions.length, version_at: v.at || null, version_by: v.by || null,
+    is_current: !!v.current, in_library: s.in_library, deleted: s.deleted, edits: s.edits,
+  };
+}
+
+// Audit execute.start entries, parsed once: who, from where, which targets, hashes of the text.
+export function prepAuditStarts(entries = []) {
+  return entries.filter((e) => /start$/i.test(String(e.action || ''))).map((e) => {
+    const req = parseLoose(e.request) || {};
+    const shas = new Set();
+    for (const k of ['command', 'script']) {
+      const v = req[k];
+      if (typeof v !== 'string' || !v) continue;
+      shas.add(normScriptSha256(v));
+      const dec = maybeBase64(v);
+      if (dec !== null) shas.add(normScriptSha256(dec));
+    }
+    return {
+      ts: Date.parse(e.timestamp), at: toUtcIso(e.timestamp), username: e.username || null, remote_ip: e.remote_ip || null,
+      affected_id: e.affected_id ? String(e.affected_id) : null, client_id: e.client_id ? String(e.client_id) : null,
+      client_hostname: e.client_hostname || null, client_ids: (Array.isArray(req.client_ids) ? req.client_ids : []).map(String),
+      group_ids: Array.isArray(req.group_ids) ? req.group_ids : [], is_sudo: req.is_sudo ?? null, shas, application: e.application || null,
+    };
+  });
+}
+
+// Match a run to its audit execute.start: by multi job id (affected_id), by jid, else by
+// client + text hash + start time within 2 minutes (nearest wins).
+export function matchAuditStart(run, starts) {
+  if (run.multi_job_id) {
+    const m = starts.find((s) => s.affected_id === String(run.multi_job_id));
+    if (m) return { entry: m, by: 'multi_job_id' };
+  }
+  const j = starts.find((s) => s.affected_id && s.affected_id === String(run.jid));
+  if (j) return { entry: j, by: 'jid' };
+  const t = Date.parse(run.started_utc || run.finished_utc || '');
+  let best = null;
+  for (const s of starts) {
+    if (Number.isNaN(s.ts) || Number.isNaN(t) || Math.abs(s.ts - t) > HISTORY.AUDIT_MATCH_MS) continue;
+    if (!(s.client_id === run.client_id || s.client_ids.includes(run.client_id))) continue;
+    if (!s.shas.has(run.norm_sha256)) continue;
+    if (!best || Math.abs(s.ts - t) < Math.abs(best.ts - t)) best = s;
+  }
+  return best ? { entry: best, by: 'client+sha+time' } : null;
+}
+
+const versionLabel = (sc) => (sc ? `${sc.library_name}@v${sc.version}/${sc.versions_total}` : 'not in library (ad-hoc)');
+
+// One RUN record per client job. env = { clientsById, libIndex, auditAvailable, auditStarts, multiById, multiRunCounts }
+export function buildRunRecord(slim, env) {
+  const c = env.clientsById.get(String(slim.client_id)) || {};
+  const osFamily = clientOsFamily(c);
+  const started = toUtcIso(slim.started_at);
+  const finished = toUtcIso(slim.finished_at);
+  const startedMs = Date.parse(started || '');
+  const kind = slim.is_script ? 'script' : 'command';
+  const sc = attributeScript(slim.command_norm_sha256, startedMs, env.libIndex);
+  const interp = resolveInterpreter(slim.interpreter, osFamily);
+  const run = {
+    jid: slim.jid, kind, status: slim.status || 'unknown',
+    started_utc: started, finished_utc: finished, started_local: slim.started_at, finished_local: slim.finished_at,
+    duration_s: started && finished ? Math.round((Date.parse(finished) - Date.parse(started)) / 10) / 100 : null,
+    created_by: slim.created_by, remote_ip: null, audit_match: null, audit_username: null,
+    client_id: slim.client_id, client_name: null, client_name_source: null, client_os_family: osFamily, client_os_kernel: c.os_kernel || null,
+    attribution: kind === 'command' && !sc ? 'ad-hoc command' : versionLabel(sc),
+    script: sc ? { library_id: sc.library_id, library_name: sc.library_name, version: sc.version, versions_total: sc.versions_total, version_at: sc.version_at, version_by: sc.version_by, is_current: sc.is_current, deleted: sc.deleted } : null,
+    sha256: slim.command_sha256, norm_sha256: slim.command_norm_sha256, first_line: slim.command_first_line, line_count: slim.command_lines,
+    command_preview: slim.command_preview,
+    interpreter: slim.interpreter || '', interpreter_resolved: interp.resolved, is_sudo: !!slim.is_sudo, timeout_sec: slim.timeout_sec, cwd: slim.cwd,
+    scheduled: !!slim.schedule_id, schedule_id: slim.schedule_id, multi_job_id: slim.multi_job_id, multi_targets: null,
+    error: slim.error, summary: slim.summary, stdout_tail: slim.stdout_tail, stderr_tail: slim.stderr_tail,
+    stdout_bytes: slim.stdout_bytes, stderr_bytes: slim.stderr_bytes, flags: [],
+  };
+  const m = env.auditAvailable ? matchAuditStart(run, env.auditStarts || []) : null;
+  if (m) Object.assign(run, { remote_ip: m.entry.remote_ip, audit_match: m.by, audit_username: m.entry.username, created_by: run.created_by || m.entry.username });
+  if (slim.client_name) Object.assign(run, { client_name: slim.client_name, client_name_source: 'job' });
+  else if (c.name) Object.assign(run, { client_name: c.name, client_name_source: 'clients list' });
+  else if (m && m.entry.client_hostname) Object.assign(run, { client_name: m.entry.client_hostname, client_name_source: 'audit client_hostname' });
+  if (run.multi_job_id) {
+    const md = env.multiById && env.multiById.get(String(run.multi_job_id));
+    run.multi_targets = md && md.targets ? md.targets : (env.multiRunCounts && env.multiRunCounts.get(String(run.multi_job_id))) || 1;
+  }
+
+  const flag = (code, text) => run.flags.push({ code, text });
+  const fl = slim.flavor || { posix: [], windows: [] };
+  if (osFamily === 'windows' && (interp.kind === 'cmd' || interp.kind === 'powershell') && fl.posix.length && (fl.posix.includes('shebang') || !fl.windows.length)) {
+    flag('INTERPRETER_OS_MISMATCH', `script looks POSIX (${fl.posix.join(', ')}) but ran with ${interp.resolved} on a Windows client`);
+  } else if (osFamily === 'unix' && interp.kind === 'posix' && fl.windows.length && !fl.posix.length) {
+    flag('INTERPRETER_OS_MISMATCH', `script looks cmd/PowerShell (${fl.windows.join(', ')}) but ran with ${interp.resolved} on a Unix client`);
+  }
+  if (run.is_sudo) flag('SUDO', 'ran with elevated privileges (is_sudo)');
+  else if (slim.inline_sudo && interp.kind !== 'cmd' && interp.kind !== 'powershell') flag('INLINE_SUDO', FLAG_CODES.INLINE_SUDO);
+  if (!sc) flag('NOT_FROM_LIBRARY', `${kind} text matches no library script or audited library version`);
+  else if (!sc.is_current) flag('LIBRARY_VERSION_OUTDATED', sc.deleted && !sc.in_library ? `matches ${versionLabel(sc)} of a script since deleted from the library` : `matches ${versionLabel(sc)} (${sc.version_at || 'time unknown'}); the library has changed since`);
+  if (sc && !Number.isNaN(startedMs)) {
+    const edit = sc.edits.filter((e) => { const d = startedMs - Date.parse(e.at); return d >= 0 && d <= HISTORY.EDIT_WINDOW_MS; }).pop();
+    if (edit) flag('RAN_SOON_AFTER_LIBRARY_EDIT', `started ${Math.round((startedMs - Date.parse(edit.at)) / 60000)} min after ${sc.library_name} was edited${edit.by ? ' by ' + edit.by : ''} (${edit.at})`);
+  }
+  const now = env.now ?? Date.now();
+  const lastSeen = Number.isNaN(startedMs) ? Date.parse(finished || '') : startedMs;
+  if (run.status === 'unknown') {
+    flag('UNKNOWN_MAY_STILL_RUN', `the server stopped observing after timeout_sec; the process may still be running on the client${!Number.isNaN(lastSeen) && now - lastSeen > 86400000 ? '; long past its timeout; check the client before assuming anything' : ''}`);
+  }
+  if (run.status === 'running') {
+    const stale = !Number.isNaN(startedMs)
+      ? now > startedMs + (Number(run.timeout_sec) || 0) * 1000 + HISTORY.STALE_GRACE_MS
+      : !Number.isNaN(lastSeen) && now - lastSeen > 86400000;
+    if (stale) flag('STALE_RUNNING', FLAG_CODES.STALE_RUNNING);
+    else flag('STILL_RUNNING', 'job still running (started recently, within timeout_sec + 10 min)');
+  }
+  if (run.status === 'failed') flag('FAILED', run.error || 'job failed');
+  if (env.auditAvailable && !m) flag('NO_AUDIT_RECORD', 'no matching execute.start in the audit log (who/from where unverified)');
+  // The web UI runs single-client jobs through the multi-job endpoint: only >1 target is notable.
+  if (run.multi_job_id && run.multi_targets > 1) flag('MULTI_CLIENT', `part of multi-client job ${run.multi_job_id} (${run.multi_targets} targets)`);
+  if (run.scheduled) flag('SCHEDULED', `started by schedule ${run.schedule_id}`);
+  if (slim.client_name === '') flag('EMPTY_CLIENT_NAME', `the job has an empty client_name; shown as ${run.client_name || run.client_id} (${run.client_name_source || 'client id'})`);
+  if (slim.output_truncated || run.stdout_bytes + run.stderr_bytes > HISTORY.LARGE_OUTPUT_BYTES) flag('OUTPUT_TRUNCATED_OR_LARGE', `output ${run.stdout_bytes + run.stderr_bytes} bytes${slim.output_truncated ? ', reported as truncated' : ''}; only the last ${HISTORY.TAIL_LINES} lines are shown`);
+  return run;
+}
+
+export function summarizeRuns(runs) {
+  const count = (keyFn) => {
+    const o = {};
+    for (const r of runs) { const k = keyFn(r); o[k] = (o[k] || 0) + 1; }
+    return o;
+  };
+  const flags = {};
+  for (const r of runs) for (const f of r.flags) flags[f.code] = (flags[f.code] || 0) + 1;
+  return {
+    by_script: count((r) => (r.script ? r.script.library_name : r.kind === 'command' ? 'ad-hoc command' : 'ad-hoc script')),
+    by_user: count((r) => r.created_by || '(unknown)'),
+    by_client: count((r) => r.client_name || r.client_id || '(unknown)'),
+    by_status: count((r) => r.status),
+    flags,
+    flag_legend: Object.fromEntries(Object.keys(flags).map((k) => [k, FLAG_CODES[k] || ''])),
+  };
+}
+
+const cell = (v) => String(v ?? '').replace(/\|/g, '\\|').replace(/\r?\n/g, ' ');
+function groupTable(title, runs, keyFn) {
+  const g = new Map();
+  for (const r of runs) {
+    const k = keyFn(r);
+    const x = g.get(k) || { runs: 0, failed: 0, flagged: 0, last: '' };
+    x.runs++;
+    if (r.status === 'failed') x.failed++;
+    if (r.flags.length) x.flagged++;
+    if ((r.started_utc || '') > x.last) x.last = r.started_utc || '';
+    g.set(k, x);
+  }
+  const rows = [...g.entries()].sort((p, q) => q[1].runs - p[1].runs);
+  return [`## ${title}`, '', `| ${title.replace(/^Per /, '')} | runs | failed | flagged | last run (UTC) |`, '|---|---|---|---|---|',
+    ...rows.map(([k, x]) => `| ${cell(k)} | ${x.runs} | ${x.failed} | ${x.flagged} | ${cell(x.last || '-')} |`), ''];
+}
+
+export function renderHistoryReport(h) {
+  const cv = h.coverage;
+  const matched = h.runs_matched;
+  const L = [`# RPort script run history - ${cell(h.server)}`, '', `Generated ${h.generated_at}. All times are UTC (the client-clock original is kept in the JSON as started_local).`, ''];
+  const fl = Object.entries(h.filters).filter(([, v]) => v !== null && v !== undefined && v !== false).map(([k, v]) => `${k}=${v}`).join(', ');
+  L.push('## Coverage', '');
+  L.push(`Scanned ${cv.clients_scanned} client(s): ${cv.jobs} job(s) listed, ${cv.details_fetched} job detail(s) fetched, ${cv.from_cache} from the local cache; ${cv.multi_jobs} multi-client job(s) in range; ${cv.audit_script_entries} audit script entr(ies) in range. `
+    + (cv.audit_available ? `The audit log covers ${cv.audit_matched_runs} of ${matched} runs.` : `Audit log unavailable (${cv.audit_reason || 'no access'}): who/from-where comes from the jobs only.`)
+    + ` Showing ${h.runs.length} of ${matched} matching run(s), most recent first.${fl ? ' Filters: ' + fl + '.' : ''}`, '');
+  if (h.warnings.length) L.push(...h.warnings.map((w) => `- warning: ${cell(w)}`), '');
+  L.push('## Timeline', '', '| UTC time | user | client | script@version | sudo | status | flags |', '|---|---|---|---|---|---|---|');
+  for (const r of h.runs) {
+    L.push(`| ${cell(r.started_utc || r.finished_utc || '-')} | ${cell(r.created_by || '?')}${r.remote_ip ? ' (' + cell(r.remote_ip) + ')' : ''} | ${cell(r.client_name || r.client_id)} | ${cell(r.attribution)} | ${r.is_sudo ? 'yes' : r.flags.some((f) => f.code === 'INLINE_SUDO') ? 'inline' : 'no'} | ${cell(r.status)} | ${cell(r.flags.map((f) => f.code).join(', '))} |`);
+  }
+  L.push('');
+  L.push(...groupTable('Per script', h.runs, (r) => (r.script ? r.script.library_name : r.attribution)));
+  L.push(...groupTable('Per user', h.runs, (r) => r.created_by || '(unknown)'));
+  L.push(...groupTable('Per client', h.runs, (r) => r.client_name || r.client_id));
+  L.push('## Attention', '');
+  const counts = h.summary && h.summary.flags ? Object.entries(h.summary.flags).sort((p, q) => q[1] - p[1]) : [];
+  if (counts.length) {
+    L.push('| flag | runs | meaning |', '|---|---|---|', ...counts.map(([k, n]) => `| ${k} | ${n} | ${cell(FLAG_CODES[k] || '')} |`), '');
+  }
+  const quiet = new Set(['SCHEDULED']);
+  const att = h.runs.filter((r) => r.flags.some((f) => !quiet.has(f.code)));
+  if (!att.length) L.push('No flagged runs.');
+  for (const r of att) {
+    L.push(`- ${cell(r.started_utc || '-')} ${cell(r.client_name || r.client_id)} ${cell(r.attribution)} by ${cell(r.created_by || '?')} (jid ${cell(r.jid)}):`);
+    for (const f of r.flags) L.push(`  - ${f.code}: ${cell(f.text)}`);
+  }
+  L.push('');
+  return L.join('\n');
+}
+
+async function mapLimit(items, n, fn) {
+  const res = new Array(items.length);
+  let i = 0;
+  const worker = async () => { while (i < items.length) { const k = i++; res[k] = await fn(items[k], k); } };
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
+  return res;
+}
+
+// GET every page (page[limit]/page[offset]); stops on a short page or at meta.count.
+async function getAllPages(ctx, conn, p, query, pageSize, warnings) {
+  const all = [];
+  for (let page = 0; page < HISTORY.MAX_PAGES; page++) {
+    const r = await api(ctx, conn, 'GET', p, { query: { ...query, 'page[limit]': pageSize, 'page[offset]': page * pageSize } });
+    const list = Array.isArray(r.data) ? r.data : [];
+    all.push(...list);
+    const count = r.meta ? Number(r.meta.count) : NaN;
+    if (list.length < pageSize || (Number.isFinite(count) && all.length >= count)) return all;
+  }
+  if (warnings) warnings.push(`${p}: stopped after ${HISTORY.MAX_PAGES} pages (${all.length} rows); older entries were not read`);
+  return all;
+}
+
+// Audit log (needs the auditlog permission). On 403/404 history continues without it.
+async function loadAudit(ctx, conn, warnings) {
+  const res = { available: true, reason: null, script: [], library: [], command: [] };
+  const apps = [['script', 'client.script'], ['library', 'library.script'], ['command', 'client.command']];
+  for (const [k, app] of apps) {
+    try {
+      res[k] = await getAllPages(ctx, conn, AUDIT, { 'filter[application]': app }, 100, warnings);
+    } catch (e) {
+      if (!(e instanceof ApiError) || ![400, 403, 404, 501].includes(e.status)) throw e;
+      if (k === 'script') {
+        return { available: false, reason: `HTTP ${e.status}${e.status === 403 ? ': the RPort user lacks the auditlog permission' : ''}`, script: [], library: [], command: [] };
+      }
+      warnings.push(`audit log ${app}: HTTP ${e.status}, skipped`);
+    }
+  }
+  return res;
+}
+
+const safeName = (s) => String(s).replace(/[^A-Za-z0-9._-]/g, '_');
+const cacheDir = (server) => path.join(stateDir(), 'history-cache', safeName(server));
+function readCache(file) {
+  try { return JSON.parse(fs.readFileSync(file, 'utf8')); } catch { return null; }
+}
+function writeCache(file, obj) {
+  ensureStateDir();
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(file, redact(JSON.stringify(obj)) + '\n', { mode: 0o600 });
+}
+
+// Job detail, from the cache when finished (immutable) unless --refresh. running/unknown never cached.
+async function loadJobDetail(ctx, conn, clientId, jid, opts) {
+  const file = path.join(cacheDir(conn.name), `${safeName(jid)}.json`);
+  if (!opts.refresh) {
+    const c = readCache(file);
+    if (c && c._v === HISTORY.CACHE_VERSION && String(c.client_id) === String(clientId) && !NOT_FINAL.has(c.status)) {
+      opts.counters.from_cache++;
+      return c;
+    }
+  }
+  let job;
+  try {
+    job = (await scriptApi(ctx, conn, 'GET', jobPath(clientId, jid))).data;
+  } catch (e) {
+    if (e instanceof ApiError && e.status === 404) { opts.warnings.push(`job ${jid} on client ${clientId} vanished (404)`); return null; }
+    throw e;
+  }
+  opts.counters.details_fetched++;
+  const slim = slimJob({ ...job, client_id: (job && job.client_id) || clientId, jid: (job && job.jid) || jid });
+  if (!NOT_FINAL.has(slim.status)) writeCache(file, slim);
+  return slim;
+}
+
+function slimMulti(d) {
+  const jobs = Array.isArray(d.jobs) ? d.jobs : [];
+  const clientIds = Array.isArray(d.client_ids) ? d.client_ids : [];
+  return {
+    _v: HISTORY.CACHE_VERSION, jid: String(d.jid), started_at: d.started_at || null, created_by: d.created_by || null, schedule_id: d.schedule_id || null,
+    client_ids: clientIds.map(String), group_ids: Array.isArray(d.group_ids) ? d.group_ids : [], targets: Math.max(clientIds.length, jobs.length) || null,
+    interpreter: d.interpreter ?? '', is_sudo: isOn(d.is_sudo), execute_concurrently: d.execute_concurrently ?? null, abort_on_error: d.abort_on_error ?? null,
+    job_statuses: jobs.map((j) => j.status || ''),
+  };
+}
+
+async function loadMultiDetail(ctx, conn, id, opts) {
+  const file = path.join(cacheDir(conn.name), `multi-${safeName(id)}.json`);
+  if (!opts.refresh) {
+    const c = readCache(file);
+    if (c && c._v === HISTORY.CACHE_VERSION) { opts.counters.from_cache++; return c; }
+  }
+  try {
+    const d = (await api(ctx, conn, 'GET', `${MULTI_JOBS}/${encodeURIComponent(id)}`)).data;
+    if (!d) return null;
+    opts.counters.details_fetched++;
+    const m = slimMulti(d);
+    if (m.job_statuses.length && m.job_statuses.every((s) => !NOT_FINAL.has(s))) writeCache(file, m);
+    return m;
+  } catch (e) {
+    if (e instanceof ApiError && [403, 404].includes(e.status)) { opts.warnings.push(`multi job ${id}: HTTP ${e.status}`); return null; }
+    throw e;
+  }
+}
+
+function writeReport(text, file, now) {
+  let p;
+  if (file) {
+    p = path.resolve(String(file));
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+  } else {
+    ensureStateDir();
+    const d = path.join(stateDir(), 'reports');
+    fs.mkdirSync(d, { recursive: true, mode: 0o700 });
+    p = path.join(d, `history-${new Date(now).toISOString().replace(/[:.]/g, '-')}.md`);
+  }
+  fs.writeFileSync(p, redact(text) + '\n', { mode: 0o600 });
+  return p;
+}
+
+const inRange = (iso, since, until) => {
+  const t = Date.parse(iso || '');
+  if (Number.isNaN(t)) return since === null && until === null;
+  return (since === null || t >= since) && (until === null || t <= until);
+};
+
+async function cmdScriptsHistory(ctx, a, conn) {
+  if (a._.length !== 2) throw usage('scripts history takes no positional arguments; filter with --client, --user, --script, --since, --until, --status');
+  const now = Date.now();
+  const since = a.f.since !== undefined ? parseWhen(a.f.since, now, '--since') : null;
+  const until = a.f.until !== undefined ? parseWhen(a.f.until, now, '--until') : null;
+  const limit = a.f.limit !== undefined ? wholeNumber(a.f.limit, '--limit') : HISTORY.LIMIT_DEFAULT;
+  if (limit < 1) throw usage('--limit must be at least 1');
+  const warnings = [];
+  const counters = { details_fetched: 0, from_cache: 0 };
+  const opts = { refresh: !!a.f.refresh, counters, warnings };
+  const progress = (m) => { if (ctx.debug) errOut(`history: ${m}`); };
+  const filters = {
+    client: a.f.client ?? null, user: a.f.user ?? null, script: a.f.script ?? null, status: a.f.status ?? null,
+    since: since === null ? null : new Date(since).toISOString(), until: until === null ? null : new Date(until).toISOString(), limit, refresh: !!a.f.refresh,
+  };
+
+  progress('reading the script library');
+  const library = await listLibrary(ctx, conn);
+  progress('reading clients');
+  const clients = await getAllPages(ctx, conn, '/clients', { 'fields[clients]': CLIENT_FIELDS }, 500, warnings);
+  const clientsById = new Map(clients.map((c) => [String(c.id), c]));
+  const scan = a.f.client ? [await resolveClient(ctx, conn, a.f.client)] : [...clientsById.keys()];
+  progress('reading the audit log');
+  const audit = await loadAudit(ctx, conn, warnings);
+  const libIndex = buildLibraryIndex(library, audit.library);
+  const auditStarts = prepAuditStarts([...audit.script, ...audit.command]);
+
+  progress(`listing jobs on ${scan.length} client(s)`);
+  let listed = 0;
+  const lists = await mapLimit(scan, HISTORY.CONCURRENCY, async (id) => {
+    try {
+      const jobs = await getAllPages(ctx, conn, `/clients/${encodeURIComponent(id)}/commands`, {}, 100, warnings);
+      listed += jobs.length;
+      return { id, jobs };
+    } catch (e) {
+      if (e instanceof ApiError && [403, 404].includes(e.status)) { warnings.push(`client ${id}: job list HTTP ${e.status}`); return { id, jobs: [] }; }
+      throw mapScriptApiError(e);
+    }
+  });
+  const wanted = [];
+  for (const { id, jobs } of lists) {
+    for (const j of jobs) {
+      if (!j || !j.jid) continue;
+      const fin = toUtcIso(j.finished_at);
+      if (since !== null && fin && Date.parse(fin) < since) continue; // finished before the window: started before it too
+      wanted.push({ id, jid: String(j.jid) });
+    }
+  }
+  progress(`job details: ${wanted.length} (cache ${opts.refresh ? 'bypassed' : 'used'})`);
+  const slims = (await mapLimit(wanted, HISTORY.CONCURRENCY, (w) => loadJobDetail(ctx, conn, w.id, w.jid, opts))).filter(Boolean);
+  const inWindow = slims.filter((s) => inRange(toUtcIso(s.started_at) || toUtcIso(s.finished_at), since, until));
+
+  progress('reading multi-client jobs');
+  let multiList = [];
+  try {
+    multiList = await getAllPages(ctx, conn, MULTI_JOBS, {}, 50, warnings);
+  } catch (e) {
+    if (!(e instanceof ApiError && [403, 404].includes(e.status))) throw e;
+    warnings.push(`multi-client job list: HTTP ${e.status}`);
+  }
+  const multiRunCounts = new Map();
+  for (const s of slims) if (s.multi_job_id) multiRunCounts.set(String(s.multi_job_id), (multiRunCounts.get(String(s.multi_job_id)) || 0) + 1);
+  const multiIds = [...new Set(inWindow.map((s) => s.multi_job_id).filter(Boolean).map(String))];
+  const multiById = new Map();
+  for (const [i, m] of (await mapLimit(multiIds, HISTORY.CONCURRENCY, (id) => loadMultiDetail(ctx, conn, id, opts))).entries()) if (m) multiById.set(multiIds[i], m);
+
+  const env = { clientsById, libIndex, auditAvailable: audit.available, auditStarts, multiById, multiRunCounts };
+  const lc = (v) => String(v ?? '').toLowerCase();
+  let runs = inWindow.map((s) => buildRunRecord(s, env));
+  if (filters.user) runs = runs.filter((r) => lc(r.created_by) === lc(filters.user) || lc(r.audit_username) === lc(filters.user));
+  if (filters.status) runs = runs.filter((r) => lc(r.status) === lc(filters.status));
+  if (filters.script) {
+    const q = lc(filters.script);
+    runs = runs.filter((r) => (r.script && (lc(r.script.library_name) === q || lc(r.script.library_id) === q)) || (!r.script && ['ad-hoc', 'adhoc'].includes(q)));
+  }
+  runs.sort((x, y) => String(y.started_utc || y.finished_utc || '').localeCompare(String(x.started_utc || x.finished_utc || '')));
+  const matched = runs.length;
+  const auditMatched = runs.filter((r) => r.audit_match).length;
+  const shown = runs.slice(0, limit);
+
+  const result = {
+    generated_at: new Date(now).toISOString(), server: conn.name, filters,
+    coverage: {
+      clients_scanned: scan.length, jobs: listed, multi_jobs: multiList.filter((m) => inRange(toUtcIso(m.started_at), since, until)).length,
+      audit_script_entries: audit.script.filter((e) => inRange(toUtcIso(e.timestamp), since, until)).length,
+      audit_available: audit.available, audit_reason: audit.available ? null : audit.reason, audit_matched_runs: auditMatched,
+      details_fetched: counters.details_fetched, from_cache: counters.from_cache,
+    },
+    runs_matched: matched, runs_returned: shown.length,
+    summary: summarizeRuns(runs),
+    runs: shown, warnings, report_file: null,
+  };
+  result.report_file = writeReport(renderHistoryReport(result), a.f.report, now);
+  const text = JSON.stringify(result, null, ctx.json ? 0 : 2);
+  if (a.f.out) {
+    const p = path.resolve(String(a.f.out));
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, redact(text) + '\n', { mode: 0o600 });
+  }
+  out(text);
+}
+
+// `scripts job`: the same attribution / flags / UTC times as history, for one job. Read-only.
+async function historyRecordForJob(ctx, conn, clientId, job) {
+  if (!job) return null;
+  const warnings = [];
+  const library = await listLibrary(ctx, conn);
+  const audit = await loadAudit(ctx, conn, warnings);
+  const client = await getClient(ctx, conn, clientId);
+  const slim = slimJob({ ...job, client_id: job.client_id || clientId });
+  let multiById = new Map();
+  if (slim.multi_job_id) {
+    const m = await loadMultiDetail(ctx, conn, slim.multi_job_id, { refresh: false, counters: { details_fetched: 0, from_cache: 0 }, warnings });
+    if (m) multiById = new Map([[String(slim.multi_job_id), m]]);
+  }
+  const env = {
+    clientsById: new Map(client ? [[String(clientId), client]] : []), libIndex: buildLibraryIndex(library, audit.library),
+    auditAvailable: audit.available, auditStarts: prepAuditStarts([...audit.script, ...audit.command]), multiById, multiRunCounts: new Map(),
+  };
+  const r = buildRunRecord(slim, env);
+  r.audit_available = audit.available;
+  return r;
+}
+
 async function cmdScripts(ctx, a) {
   const sub = a._[1] || 'list';
   const conn = connFor(ctx.cfg, a.f.server);
@@ -1377,9 +2046,15 @@ async function cmdScripts(ctx, a) {
     const clientId = await resolveClient(ctx, conn, ref);
     const job = (await scriptApi(ctx, conn, 'GET', jobPath(clientId, jid), { hint404: `no job ${jid} on client ${clientId}; list them with: scripts jobs ${ref}` })).data;
     const result = jobSummary(job, { jid, clientId });
+    try {
+      result.history = await historyRecordForJob(ctx, conn, clientId, job);
+    } catch (e) {
+      result.history_error = e && e.message ? e.message.split('\n')[0] : String(e);
+    }
     result.output_file = writeJobFile(job, a.f.out, jid);
     return printJob(ctx, result);
   }
+  if (sub === 'history') return cmdScriptsHistory(ctx, a, conn);
   if (sub === 'jobs') {
     const ref = a._[2];
     if (!ref) throw usage('scripts jobs <client> [--limit N]');
@@ -1493,6 +2168,15 @@ Scripts (only library scripts, one client per run; <script> = name, case-insensi
                                        (status, output tails); full job JSON to --out or <state>/jobs/<jid>.json
   scripts job <client> <jid> [--out FILE]   one job: status, error, output tails, full file
   scripts jobs <client> [--limit N]    recent jobs on that client
+  scripts history [--client X] [--user U] [--script NAME|ID|ad-hoc] [--since ISO|7d|24h]
+          [--until ISO|age] [--status S] [--limit 200] [--out FILE] [--report FILE] [--refresh]
+                                       READ-ONLY run history (GET only, nothing is executed): one
+                                       record per client job joined with the library (version by
+                                       sha256), multi-client jobs and the audit log (who, from
+                                       where); UTC times, flags, redacted output tails. JSON on
+                                       stdout; Markdown report to --report or <state>/reports/;
+                                       finished job details cached in <state>/history-cache/
+                                       (--refresh bypasses). --script must follow "scripts history".
 Script library admin changes (only on the operator's explicit request; --dry-run first):
   scripts add <name> --file <path> [--interpreter I] [--cwd D] [--sudo] [--timeout SEC] [--tags a,b]
   scripts update <script> [--file <path>] [--name N] [--interpreter I] [--cwd D] [--sudo|--no-sudo]
@@ -1520,11 +2204,11 @@ library or 60s, max 3600s; request body max 10240 bytes; status "unknown" means 
 server stopped watching and the process may still run (no cancel exists).
 
 Exit codes: 0 ok, 1 usage, 2 guardrail refusal, 3 API error, 4 config error.
-State: ~/.config/rport-skill/ (config.json, ledger.jsonl, jobs/); override with RPORT_SKILL_HOME.`;
+State: ~/.config/rport-skill/ (config.json, ledger.jsonl, jobs/, reports/, history-cache/); override with RPORT_SKILL_HOME.`;
 
-const BOOL_FLAGS = new Set(['json', 'dry-run', 'force', 'allow-lan-target', 'debug', 'replace', 'http-proxy', 'help', 'sudo', 'no-sudo']);
+const BOOL_FLAGS = new Set(['json', 'dry-run', 'force', 'allow-lan-target', 'debug', 'replace', 'http-proxy', 'help', 'sudo', 'no-sudo', 'refresh']);
 const VALUE_FLAGS = new Set(['server', 'client', 'remote', 'acl', 'idle', 'auto-close', 'scheme', 'protocol', 'public-port', 'fleet-member', 'name', 'def', 'since', 'tunnel', 'url', 'user', 'token-secret', 'runner-member', 'auth-user', 'host-header',
-  'query', 'timeout', 'cwd', 'wait', 'out', 'file', 'interpreter', 'tags', 'limit']);
+  'query', 'timeout', 'cwd', 'wait', 'out', 'file', 'interpreter', 'tags', 'limit', 'until', 'status', 'report']);
 const FORBIDDEN_FLAGS = {
   script: 'script text is never passed on the command line: run a library script (scripts run), or add one from a file (scripts add --file).',
   command: 'ad-hoc commands are never run: only a script from the server\'s library runs (scripts run).',
@@ -1549,7 +2233,17 @@ export function parseArgs(argv) {
     let v;
     const eq = k.indexOf('=');
     if (eq >= 0) { v = k.slice(eq + 1); k = k.slice(0, eq); }
-    if (FORBIDDEN_FLAGS[k]) throw guard(FORBIDDEN_FLAGS[k]);
+    // `scripts history --script NAME` is a read-only filter, not script text: allowed there only.
+    const historyFilter = k === 'script' && _[0] === 'scripts' && _[1] === 'history';
+    if (FORBIDDEN_FLAGS[k] && !historyFilter) throw guard(FORBIDDEN_FLAGS[k]);
+    if (historyFilter) {
+      if (v === undefined) {
+        v = argv[++i];
+        if (v === undefined) throw usage('--script needs a value');
+      }
+      f.script = v;
+      continue;
+    }
     if (BOOL_FLAGS.has(k)) f[k] = v === undefined ? true : !/^(0|false|no)$/i.test(v);
     else if (VALUE_FLAGS.has(k)) {
       if (v === undefined) {

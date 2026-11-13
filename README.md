@@ -18,7 +18,7 @@ Some plugins need [apra-fleet](https://github.com/Apra-Labs/apra-fleet) (see **N
 | Plugin | What it does | Needs |
 |---|---|---|
 | [bitbucket](plugins/bitbucket) | Bitbucket Cloud done right: REST and git authentication (API tokens with scopes, access tokens), repos and code, pull requests and reviews, pipelines and logs, deployments. The token never reaches the agent. | apra-fleet 0.4.4+ (MCP, with a local member), Node.js 18+, a Bitbucket API token with scopes or an access token |
-| [rport](plugins/rport) | Safe RPort (rportd/openrport) work: stored tunnels, revive, expiry bookkeeping, repointing apra-fleet members when a port changes; running reviewed library scripts on one client. The API token never reaches the agent. | apra-fleet 0.4.4+ (MCP, with a local member), Node.js 18+ |
+| [rport](plugins/rport) | Safe RPort (rportd/openrport) work: stored tunnels, revive, expiry bookkeeping, repointing apra-fleet members when a port changes; running reviewed library scripts on one client; explaining script run history. The API token never reaches the agent. | apra-fleet 0.4.4+ (MCP, with a local member), Node.js 18+ |
 
 ## Other agents
 
