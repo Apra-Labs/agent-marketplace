@@ -7,6 +7,8 @@ and any LLM provider that can call apra-fleet tools.
 
 The skill is chapter-based. **tunnels** is available: stored tunnels as definitions, revive with
 reuse, expiry bookkeeping, and repointing an apra-fleet member when a tunnel's port changes.
+**scripts** is available: browse the server script library and job results, and run a reviewed
+library script on one client on request (no ad-hoc code, no multi-client runs, sudo only when asked).
 **clients** and **users** are planned.
 
 The agent never sees your RPort API token. It stays in the apra-fleet credential store and reaches
@@ -65,7 +67,7 @@ alice --token-secret RPORT_LAB_TOKEN`, then `--server lab`.
   loops, no force-closing active tunnels unless asked.
 - Exit codes: `0` ok, `1` usage, `2` guardrail refusal, `3` API error, `4` config error.
 
-Details: `skills/rport/SKILL.md` and `skills/rport/chapters/tunnels.md`.
+Details: `skills/rport/SKILL.md`, `skills/rport/chapters/tunnels.md` and `skills/rport/chapters/scripts.md`.
 
 ## Layout
 
@@ -74,6 +76,7 @@ Details: `skills/rport/SKILL.md` and `skills/rport/chapters/tunnels.md`.
 skills/rport/               what Claude Code loads (and what other hosts copy)
   SKILL.md                  frontmatter + core: concepts, guardrails, apra-fleet calling, servers, chapter index
   chapters/tunnels.md       tunnels chapter
+  chapters/scripts.md       scripts chapter
   scripts/rport.mjs         Node >= 18 CLI, no npm dependencies
   templates/config.example.json
 tests/rport.test.mjs        node:test against local fake RPort servers (127.0.0.1); not loaded by Claude Code
