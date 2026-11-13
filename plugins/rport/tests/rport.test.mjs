@@ -12,6 +12,8 @@ import {
   normalizeAclSpec, parseAclEntry, resolveAcl, validateAutoClose, validateIdle, computeHardExpiry,
   parseRemote, validateStoredAcl, optionsFromStored, validateStored, aclEquals, aclCoversIp, LIMITS,
   assertAllowedRequest, validateScriptTimeout, pickLibraryScript, buildScriptRunBody, checkBodySize, tailLines, scriptSha256,
+  redactSecrets, normalizeScriptText, normScriptSha256, toUtcIso, parseWhen, resolveInterpreter, scriptFlavor, buildLibraryIndex,
+  attributeScript, matchAuditStart, prepAuditStarts, slimJob, HISTORY, hasInlineSudo,
 } from '../skills/rport/scripts/rport.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -48,6 +50,9 @@ function freshState() {
     jobSeq: ['successful'], // statuses a new job reports on successive GETs (last one sticks)
     jobOut: { stdout: 'ok\n', stderr: '', summary: 'done' },
     scriptErr: null, // { status, title } returned by POST /clients/{id}/scripts
+    multiJobs: [], // { jid, started_at, created_by, schedule_id, client_ids, group_ids, command, jobs: [...] }
+    audit: [], // { timestamp, username, remote_ip, application, action, affected_id, client_id, client_hostname, request, response }
+    auditStatus: 200, // 403 = the user lacks the auditlog permission
   };
 }
 function seedScript(fields, S = state) {
@@ -186,8 +191,31 @@ const server = http.createServer((req, res) => {
       return j ? send(res, 200, { data: publicJob(jobNext(j)) }) : send(res, 404, errBody('', 'job not found'));
     }
     if (req.method === 'GET' && (m = /^\/clients\/([^/]+)\/commands$/.exec(p))) {
+      // Real shape: the list carries only jid, status, finished_at and result.summary.
       const lim = Number(url.searchParams.get('page[limit]') || 50);
-      return send(res, 200, { data: S.jobs.filter((x) => x.client_id === m[1]).map(publicJob).reverse().slice(0, lim) });
+      const off = Number(url.searchParams.get('page[offset]') || 0);
+      const all = S.jobs.filter((x) => x.client_id === m[1]).reverse();
+      const list = all.slice(off, off + lim).map((j) => ({ jid: j.jid, status: j.status, finished_at: j.finished_at, result: { summary: (j.result && j.result.summary) || '' } }));
+      return send(res, 200, { data: list, meta: { count: all.length } });
+    }
+    // ---- multi-client jobs (read-only here) and the audit log
+    if (req.method === 'GET' && p === '/commands') {
+      const lim = Number(url.searchParams.get('page[limit]') || 50);
+      const off = Number(url.searchParams.get('page[offset]') || 0);
+      const list = S.multiJobs.slice(off, off + lim).map(({ jid, started_at, created_by, schedule_id }) => ({ jid, started_at, created_by, schedule_id }));
+      return send(res, 200, { data: list, meta: { count: S.multiJobs.length } });
+    }
+    if (req.method === 'GET' && (m = /^\/commands\/([^/]+)$/.exec(p))) {
+      const mj = S.multiJobs.find((x) => x.jid === m[1]);
+      return mj ? send(res, 200, { data: mj }) : send(res, 404, errBody('', 'multi job not found'));
+    }
+    if (req.method === 'GET' && p === '/auditlog') {
+      if (S.auditStatus !== 200) return send(res, S.auditStatus, errBody('', 'forbidden'));
+      const lim = Number(url.searchParams.get('page[limit]') || 50);
+      const off = Number(url.searchParams.get('page[offset]') || 0);
+      const app = url.searchParams.get('filter[application]');
+      const all = S.audit.filter((e) => !app || e.application === app);
+      return send(res, 200, { data: all.slice(off, off + lim), meta: { count: all.length } });
     }
     return send(res, 404, errBody('', 'no route'));
   });
@@ -1066,6 +1094,293 @@ test('scripts add / update / delete: dry-run sends nothing; real calls carry the
   assert.equal(state.library.length, 0);
 });
 
+// ---------------------------------------------------------------- scripts history (read-only)
+const isoAt = (ms) => new Date(ms).toISOString();
+// "2026-10-30T15:36:27.160+05:30": the client's clock, as RPort reports it.
+const withOffset = (ms, offMin) => {
+  const a = Math.abs(offMin);
+  return `${new Date(ms + offMin * 60000).toISOString().replace('Z', '')}${offMin >= 0 ? '+' : '-'}${String(Math.floor(a / 60)).padStart(2, '0')}:${String(a % 60).padStart(2, '0')}`;
+};
+function seedJob(fields) {
+  const j = {
+    jid: `h-${state.nextJid++}`, client_id: 'c-1', client_name: 'my-server', status: 'successful', interpreter: '', cwd: '', pid: 100,
+    is_sudo: false, is_script: true, timeout_sec: 60, created_by: USER, multi_job_id: null, schedule_id: null, error: '',
+    result: { stdout: 'ok\n', stderr: '', summary: '' }, command: 'echo hi\n', ...fields,
+  };
+  j._seq = [j.status];
+  state.jobs.push(j);
+  return j;
+}
+const audit = (fields) => state.audit.push({ remote_ip: '198.51.100.2', client_id: '', client_hostname: '', affected_id: '', response: '', ...fields });
+
+// Five jobs: J1 library script (CRLF variant, +05:30 clock, multi job, audited by multi id, secrets in
+// stdout); J2 an older audited library version (audited by fallback); J3 sudo run 10 min after a library
+// edit, no audit record; J4 bash/docker script with interpreter "" on a Windows client, empty
+// client_name, status unknown; J5 an old failed ad-hoc command.
+async function historyHome() {
+  const home = await scriptsHome();
+  const NOW = Date.now();
+  const T = { created: NOW - 30 * 86400000, edit: NOW - 3 * 3600000, j1: NOW - 3600000, j2: NOW - 2 * 86400000, j3: NOW - 3 * 3600000 + 10 * 60000, j4: NOW - 30 * 60000, j5: NOW - 10 * 86400000 };
+  state.clients = [
+    { id: 'c-1', name: 'my-server', connection_state: 'connected', os_kernel: 'linux' },
+    { id: 'c-2', name: 'offline-box', connection_state: 'disconnected', os_kernel: 'linux' },
+    { id: 'c-3', name: 'win-box', connection_state: 'connected', os_kernel: 'windows' },
+  ];
+  seedScript({ name: 'disk-check', script: 'df -h\nuptime\n', created_at: isoAt(T.created), updated_at: isoAt(T.created), created_by: 'bob', updated_by: 'bob' });
+  const deploy = seedScript({ name: 'deploy', script: 'echo v2\n', created_at: isoAt(T.created), updated_at: isoAt(T.edit), created_by: 'bob', updated_by: 'bob' });
+  audit({ timestamp: isoAt(T.created), username: 'bob', application: 'library.script', action: 'create', request: JSON.stringify({ name: 'deploy', script: 'echo v1\n', is_sudo: false, interpreter: '' }), response: JSON.stringify({ id: deploy.id, updated_by: 'bob', updated_at: isoAt(T.created) }) });
+  audit({ timestamp: isoAt(T.edit), username: 'bob', application: 'library.script', action: 'update', request: JSON.stringify({ name: 'deploy', script: 'echo v2\n' }), response: JSON.stringify({ id: deploy.id, updated_by: 'bob', updated_at: isoAt(T.edit) }) });
+  const J = {};
+  J.j1 = seedJob({
+    command: 'df -h  \r\nuptime\r\n', started_at: withOffset(T.j1, 330), finished_at: withOffset(T.j1 + 5000, 330), multi_job_id: 'multi-1', created_by: 'alice',
+    result: { stdout: 'Filesystem ok\npassword=hunter2\naws AKIAABCDEFGHIJKLMNOP\n', stderr: '', summary: '' },
+  });
+  audit({ timestamp: isoAt(T.j1 - 1000), username: 'alice', remote_ip: '198.51.100.9', application: 'client.script', action: 'execute.start', affected_id: 'multi-1', request: JSON.stringify({ client_ids: ['c-1', 'c-3'], command: 'df -h\nuptime\n', interpreter: '', is_sudo: false }) });
+  audit({ timestamp: isoAt(T.j1 + 6000), username: 'alice', remote_ip: '198.51.100.9', application: 'client.script', action: 'execute.done', affected_id: 'multi-1' });
+  state.multiJobs.push({ jid: 'multi-1', started_at: isoAt(T.j1), created_by: 'alice', schedule_id: null, client_ids: ['c-1', 'c-3'], group_ids: [], command: 'df -h', interpreter: '', is_sudo: false, execute_concurrently: true, abort_on_error: false, jobs: [{ jid: 'h-1', status: 'successful' }, { jid: 'zz', status: 'successful' }] });
+  J.j2 = seedJob({ command: 'echo v1\n', started_at: isoAt(T.j2), finished_at: isoAt(T.j2 + 1000), created_by: 'bob' });
+  audit({ timestamp: isoAt(T.j2 + 30000), username: 'bob', remote_ip: '198.51.100.7', application: 'client.script', action: 'execute.start', affected_id: 'other-multi', client_id: 'c-1', client_hostname: 'my-server', request: JSON.stringify({ client_ids: ['c-1'], command: Buffer.from('echo v1\n').toString('base64') }) });
+  J.j3 = seedJob({ command: 'echo v2\n', started_at: isoAt(T.j3), finished_at: isoAt(T.j3 + 1000), created_by: 'bob', is_sudo: true });
+  J.j4 = seedJob({
+    client_id: 'c-3', client_name: '', status: 'unknown', command: "#!/bin/bash\ndocker ps\nexport DB_PASSWORD='s3cr3t-value'\n", started_at: isoAt(T.j4), finished_at: isoAt(T.j4 + 60000), created_by: 'carol',
+    result: { stdout: '', stderr: "'docker' is not recognized\nAuthorization: Bearer abcdefghijkl\n", summary: '' },
+  });
+  J.j5 = seedJob({ is_script: false, command: 'uname -a', status: 'failed', error: 'exit status 1', started_at: isoAt(T.j5), finished_at: isoAt(T.j5 + 1000), created_by: 'alice' });
+  state.log = [];
+  return { home, T, J };
+}
+const histOf = (r) => { assert.equal(r.code, 0, r.stderr); return JSON.parse(r.stdout); };
+const runFor = (h, jid) => h.runs.find((x) => x.jid === jid);
+const codes = (run) => run.flags.map((f) => f.code);
+const detailGets = () => state.log.filter((e) => e.method === 'GET' && /^\/api\/v1\/clients\/[^/]+\/commands\/[^/]+$/.test(e.path)).map((e) => e.path.split('/').pop());
+
+test('history unit: redaction, CRLF-insensitive hash, UTC normalisation, relative times, interpreter, flavor, GET-only guard', () => {
+  const red = redactSecrets("password=hunter2 token: abc123\nexport DB_PASSWORD='x y'\nset API_KEY=zz\nAuthorization: Basic Zm9v\ncurl -H 'Authorization: Bearer tok123456'\nAKIAABCDEFGHIJKLMNOP\n-----BEGIN RSA PRIVATE KEY-----\nMIIE\n-----END RSA PRIVATE KEY-----\nplain line");
+  for (const s of ['hunter2', 'abc123', 'x y', 'zz', 'Zm9v', 'tok123456', 'AKIAABCDEFGHIJKLMNOP', 'MIIE']) assert.ok(!red.includes(s), `${s} redacted`);
+  assert.match(red, /plain line/);
+  assert.match(red, /DB_PASSWORD=\[REDACTED\]/);
+  assert.equal(normScriptSha256('df -h  \r\nuptime\r\n\r\n'), normScriptSha256('df -h\nuptime'));
+  assert.equal(normalizeScriptText('a\t\r\nb \r\n'), 'a\nb');
+  assert.notEqual(normScriptSha256('echo v1'), normScriptSha256('echo v2'));
+  assert.equal(toUtcIso('2026-10-30T15:36:27.16+05:30'), '2026-10-30T10:06:27.160Z');
+  assert.equal(toUtcIso('2026-10-30T10:06:27Z'), '2026-10-30T10:06:27.000Z');
+  assert.equal(toUtcIso('0001-01-01T00:00:00Z'), null);
+  assert.equal(parseWhen('7d', 1e12), 1e12 - 7 * 86400000);
+  assert.equal(parseWhen('24h', 1e12), 1e12 - 86400000);
+  assert.equal(parseWhen('2026-10-30T00:00:00Z'), Date.parse('2026-10-30T00:00:00Z'));
+  assert.throws(() => parseWhen('yesterday'), (e) => e.exitCode === 1);
+  assert.equal(resolveInterpreter('', 'windows').resolved, 'cmd (server default, Windows)');
+  assert.equal(resolveInterpreter('', 'unix').resolved, '/bin/sh (server default, Unix)');
+  assert.equal(resolveInterpreter('powershell', 'windows').kind, 'powershell');
+  assert.equal(resolveInterpreter('/bin/bash', 'unix').kind, 'posix');
+  assert.ok(scriptFlavor('#!/bin/bash\ndocker ps\n').posix.includes('shebang'));
+  assert.deepEqual(scriptFlavor('@echo off\necho %PATH%\n').posix, []);
+  assert.equal(slimJob({ jid: 'j', command: "X_TOKEN='abc'\n", result: { stdout: 'a\n'.repeat(40) } }).stdout_tail.split('\n').length, HISTORY.TAIL_LINES);
+  assert.ok(!JSON.stringify(slimJob({ jid: 'j', command: "X_TOKEN='abc'\n" })).includes('abc'), 'cache form holds no secret');
+  // history's requests are all GETs, which the guard lets through; the same paths stay closed to writes
+  for (const p of ['/commands', '/commands/m-1', '/auditlog', '/clients/c-1/commands', '/clients/c-1/commands/j-1', '/library/scripts']) assert.doesNotThrow(() => assertAllowedRequest('GET', p));
+  for (const [m, p] of [['POST', '/commands'], ['POST', '/clients/c-1/commands'], ['DELETE', '/commands/m-1']]) assert.throws(() => assertAllowedRequest(m, p), (e) => e.exitCode === 2);
+  // library versions + attribution
+  const idx = buildLibraryIndex(
+    [{ id: 's1', name: 'deploy', script: 'echo v2\n', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-02-01T00:00:00Z', updated_by: 'bob' }],
+    [{ timestamp: '2026-01-01T00:00:00Z', username: 'bob', action: 'create', request: JSON.stringify({ name: 'deploy', script: 'echo v1\r\n' }), response: JSON.stringify({ id: 's1' }) },
+      { timestamp: '2026-02-01T00:00:00Z', username: 'bob', action: 'update', request: JSON.stringify({ name: 'deploy', script: 'echo v2\n' }), response: JSON.stringify({ id: 's1' }) }],
+  );
+  assert.deepEqual(idx.get('s1').versions.map((v) => [v.index, !!v.current]), [[1, false], [2, true]]);
+  const old = attributeScript(normScriptSha256('echo v1'), Date.parse('2026-01-15T00:00:00Z'), idx);
+  assert.deepEqual([old.library_name, old.version, old.versions_total, old.is_current], ['deploy', 1, 2, false]);
+  assert.equal(attributeScript(normScriptSha256('rm -rf /tmp/x'), Date.now(), idx), null);
+  const starts = prepAuditStarts([{ timestamp: '2026-01-15T00:00:30Z', action: 'execute.start', client_id: 'c-1', affected_id: 'm-9', request: JSON.stringify({ command: 'echo v1' }) }]);
+  assert.equal(matchAuditStart({ jid: 'j', multi_job_id: 'm-9', client_id: 'c-9', started_utc: '2020-01-01T00:00:00Z', norm_sha256: 'x' }, starts).by, 'multi_job_id');
+  assert.equal(matchAuditStart({ jid: 'j', client_id: 'c-1', started_utc: '2026-01-15T00:00:00Z', norm_sha256: normScriptSha256('echo v1') }, starts).by, 'client+sha+time');
+  assert.equal(matchAuditStart({ jid: 'j', client_id: 'c-1', started_utc: '2026-01-15T00:05:00Z', norm_sha256: normScriptSha256('echo v1') }, starts), null, 'outside 2 min');
+});
+
+test('scripts history: GET only; list+detail join, UTC times, attribution, audit match, flags, redaction, report', async () => {
+  const { home, T, J } = await historyHome();
+  const r = await run(home, ['scripts', 'history']);
+  const h = histOf(r);
+  assert.deepEqual(state.log.filter((e) => e.method !== 'GET'), [], 'history sent only GET requests');
+  assert.ok(state.log.some((e) => e.path === '/api/v1/commands') && state.log.some((e) => e.path === '/api/v1/auditlog'));
+  assert.equal(h.server, 'default');
+  assert.deepEqual(h.runs.map((x) => x.jid), [J.j4.jid, J.j1.jid, J.j3.jid, J.j2.jid, J.j5.jid], 'most recent first');
+  assert.deepEqual([h.coverage.clients_scanned, h.coverage.jobs, h.coverage.details_fetched, h.coverage.from_cache, h.coverage.multi_jobs, h.coverage.audit_available, h.coverage.audit_matched_runs], [3, 5, 6, 0, 1, true, 2]);
+  assert.equal(h.coverage.audit_script_entries, 3);
+
+  const r1 = runFor(h, J.j1.jid);
+  assert.equal(r1.started_utc, isoAt(T.j1), '+05:30 normalised to UTC');
+  assert.match(r1.started_local, /\+05:30$/);
+  assert.equal(r1.duration_s, 5);
+  assert.deepEqual([r1.script.library_name, r1.script.is_current, r1.attribution], ['disk-check', true, 'disk-check@v1/1'], 'CRLF/trailing-space variant attributed');
+  assert.notEqual(r1.sha256, scriptSha256('df -h\nuptime\n'), 'raw sha256 is of the job text as sent');
+  assert.deepEqual([r1.audit_match, r1.remote_ip, r1.created_by, r1.multi_targets], ['multi_job_id', '198.51.100.9', 'alice', 2]);
+  assert.ok(codes(r1).includes('MULTI_CLIENT'));
+  assert.ok(!codes(r1).includes('NO_AUDIT_RECORD') && !codes(r1).includes('NOT_FROM_LIBRARY'));
+  assert.ok(!r1.stdout_tail.includes('hunter2') && !r1.stdout_tail.includes('AKIAABCDEFGHIJKLMNOP') && r1.stdout_tail.includes('[REDACTED]'));
+
+  const r2 = runFor(h, J.j2.jid);
+  assert.deepEqual([r2.script.library_name, r2.script.version, r2.script.versions_total, r2.script.is_current], ['deploy', 1, 2, false]);
+  assert.ok(codes(r2).includes('LIBRARY_VERSION_OUTDATED'));
+  assert.deepEqual([r2.audit_match, r2.remote_ip], ['client+sha+time', '198.51.100.7'], 'fallback audit match (base64 request text)');
+
+  const r3 = runFor(h, J.j3.jid);
+  assert.ok(codes(r3).includes('RAN_SOON_AFTER_LIBRARY_EDIT'));
+  assert.ok(codes(r3).includes('SUDO') && codes(r3).includes('NO_AUDIT_RECORD'));
+  assert.ok(!codes(r3).includes('LIBRARY_VERSION_OUTDATED'));
+
+  const r4 = runFor(h, J.j4.jid);
+  assert.deepEqual([r4.client_name, r4.client_name_source, r4.client_os_family], ['win-box', 'clients list', 'windows'], 'empty client_name falls back');
+  assert.equal(r4.interpreter_resolved, 'cmd (server default, Windows)');
+  for (const c of ['INTERPRETER_OS_MISMATCH', 'NOT_FROM_LIBRARY', 'EMPTY_CLIENT_NAME', 'UNKNOWN_MAY_STILL_RUN', 'NO_AUDIT_RECORD']) assert.ok(codes(r4).includes(c), c);
+  assert.equal(r4.attribution, 'not in library (ad-hoc)');
+  assert.ok(!r4.command_preview.includes('s3cr3t-value') && r4.command_preview.includes('DB_PASSWORD=[REDACTED]'));
+  assert.ok(!r4.stderr_tail.includes('abcdefghijkl'));
+
+  const r5 = runFor(h, J.j5.jid);
+  assert.equal(r5.kind, 'command');
+  assert.ok(codes(r5).includes('FAILED'));
+  assert.equal(r5.error, 'exit status 1');
+
+  assert.deepEqual(h.summary.by_status, { unknown: 1, successful: 3, failed: 1 });
+  assert.equal(h.summary.by_user.bob, 2);
+  assert.equal(h.summary.flags.NO_AUDIT_RECORD, 3);
+  for (const s of ['hunter2', 's3cr3t-value', 'abcdefghijkl', 'AKIAABCDEFGHIJKLMNOP']) assert.ok(!r.stdout.includes(s), `${s} not on stdout`);
+
+  assert.ok(h.report_file.startsWith(path.join(home, 'reports')));
+  const md = fs.readFileSync(h.report_file, 'utf8');
+  for (const s of ['## Coverage', 'The audit log covers 2 of 5 runs', '## Timeline', '| UTC time | user | client | script@version | sudo | status | flags |', '## Per script', '## Per user', '## Per client', '## Attention', 'INTERPRETER_OS_MISMATCH', 'deploy@v1/2']) assert.ok(md.includes(s), s);
+  assert.ok(!md.includes('hunter2') && !md.includes('s3cr3t-value'));
+  // the cache holds no secrets either
+  const cacheFiles = fs.readdirSync(path.join(home, 'history-cache', 'default'));
+  assert.ok(cacheFiles.includes(`${J.j1.jid}.json`) && !cacheFiles.includes(`${J.j4.jid}.json`), 'finished cached, unknown not');
+  for (const f of cacheFiles) assert.ok(!fs.readFileSync(path.join(home, 'history-cache', 'default', f), 'utf8').includes('s3cr3t-value'));
+
+  const rep = path.join(home, 'my', 'report.md');
+  const outFile = path.join(home, 'my', 'h.json');
+  const h2 = histOf(await run(home, ['scripts', 'history', '--report', rep, '--out', outFile, '--json']));
+  assert.equal(h2.report_file, rep);
+  assert.ok(fs.existsSync(rep));
+  assert.equal(JSON.parse(fs.readFileSync(outFile, 'utf8')).runs.length, 5);
+});
+
+test('scripts history: finished job details come from the cache; unknown/running are refetched; --refresh bypasses', async () => {
+  const { home, J } = await historyHome();
+  histOf(await run(home, ['scripts', 'history']));
+  assert.equal(detailGets().length, 5);
+  state.log = [];
+  let h = histOf(await run(home, ['scripts', 'history']));
+  assert.deepEqual(detailGets(), [J.j4.jid], 'only the unknown job is fetched again');
+  assert.ok(!state.log.some((e) => e.path === '/api/v1/commands/multi-1'), 'finished multi job cached');
+  assert.deepEqual([h.coverage.details_fetched, h.coverage.from_cache], [1, 5]);
+  state.log = [];
+  h = histOf(await run(home, ['scripts', 'history', '--refresh']));
+  assert.equal(detailGets().length, 5);
+  assert.deepEqual([h.coverage.details_fetched, h.coverage.from_cache], [6, 0]);
+});
+
+test('scripts history: audit log 403 -> continues, audit_available=false, no NO_AUDIT_RECORD', async () => {
+  const { home, J } = await historyHome();
+  state.auditStatus = 403;
+  const h = histOf(await run(home, ['scripts', 'history']));
+  assert.equal(h.coverage.audit_available, false);
+  assert.match(h.coverage.audit_reason, /403/);
+  assert.equal(h.runs.length, 5);
+  assert.ok(h.runs.every((x) => !codes(x).includes('NO_AUDIT_RECORD')), 'not spammed when the audit log is unavailable');
+  assert.ok(h.runs.every((x) => x.remote_ip === null));
+  assert.ok(codes(runFor(h, J.j2.jid)).includes('NOT_FROM_LIBRARY'), 'without audited versions the old text is not attributable');
+  assert.match(fs.readFileSync(h.report_file, 'utf8'), /Audit log unavailable/);
+  assert.equal(state.log.filter((e) => e.path === '/api/v1/auditlog').length, 1, 'stops asking after the first 403');
+});
+
+test('scripts history filters: --client, --user, --script, --since relative, --status, --limit', async () => {
+  const { home, J } = await historyHome();
+  let h = histOf(await run(home, ['scripts', 'history', '--client', 'win-box']));
+  assert.deepEqual(h.runs.map((x) => x.jid), [J.j4.jid]);
+  assert.equal(h.coverage.clients_scanned, 1);
+  assert.ok(!state.log.some((e) => e.path === '/api/v1/clients/c-1/commands'), 'only the named client listed');
+  state.log = [];
+  h = histOf(await run(home, ['scripts', 'history', '--since', '7d']));
+  assert.ok(!h.runs.some((x) => x.jid === J.j5.jid) && h.runs.length === 4);
+  assert.ok(!detailGets().includes(J.j5.jid), 'a job finished before --since is not fetched');
+  h = histOf(await run(home, ['scripts', 'history', '--user', 'BOB']));
+  assert.deepEqual(h.runs.map((x) => x.jid).sort(), [J.j2.jid, J.j3.jid].sort());
+  h = histOf(await run(home, ['scripts', 'history', '--script', 'deploy']));
+  assert.deepEqual(h.runs.map((x) => x.jid).sort(), [J.j2.jid, J.j3.jid].sort());
+  h = histOf(await run(home, ['scripts', 'history', '--script', 'ad-hoc']));
+  assert.deepEqual(h.runs.map((x) => x.jid).sort(), [J.j4.jid, J.j5.jid].sort());
+  h = histOf(await run(home, ['scripts', 'history', '--status', 'failed']));
+  assert.deepEqual(h.runs.map((x) => x.jid), [J.j5.jid]);
+  h = histOf(await run(home, ['scripts', 'history', '--limit', '2']));
+  assert.deepEqual([h.runs_returned, h.runs_matched, h.runs[0].jid], [2, 5, J.j4.jid]);
+  assert.equal((await run(home, ['scripts', 'history', '--since', 'yesterday'])).code, 1);
+  assert.equal((await run(home, ['scripts', 'run', 'deploy', '--client', 'my-server', '--script', 'x'])).code, 2, '--script stays forbidden outside history');
+  assert.deepEqual(writes(), []);
+});
+
+test('history flags: MULTI_CLIENT only for >1 target, STALE_RUNNING vs STILL_RUNNING, INLINE_SUDO, old UNKNOWN', async () => {
+  assert.ok(hasInlineSudo('sudo docker ps'));
+  assert.ok(hasInlineSudo('cd /x && sudo reboot'));
+  assert.ok(hasInlineSudo('echo $(sudo -n id)'));
+  assert.ok(hasInlineSudo('echo x | sudo tee /etc/y'));
+  assert.ok(hasInlineSudo('a;sudo b'));
+  assert.ok(!hasInlineSudo('# sudo reboot\necho hi'), 'comment line');
+  assert.ok(!hasInlineSudo('  #sudo x'));
+  assert.ok(!hasInlineSudo('pseudo foo\ncat /etc/sudoers\necho nosudo'), 'not a command word');
+
+  const { home, J } = await historyHome();
+  const NOW = Date.now();
+  state.multiJobs.push({ jid: 'multi-2', started_at: isoAt(NOW - 7200000), created_by: 'alice', schedule_id: null, client_ids: ['c-1'], group_ids: [], command: 'x', interpreter: '', is_sudo: false, jobs: [{ jid: 'h-6', status: 'successful' }] });
+  const single = seedJob({ multi_job_id: 'multi-2', command: 'sudo docker ps\n# sudo in a comment\n', started_at: isoAt(NOW - 7200000), finished_at: isoAt(NOW - 7199000) });
+  const reboot = seedJob({ status: 'running', command: 'sudo reboot', timeout_sec: 60, started_at: '2026-06-27T08:00:00+05:30', finished_at: null });
+  const recent = seedJob({ status: 'running', command: 'sleep 30', timeout_sec: 60, started_at: isoAt(NOW - 60000), finished_at: null });
+  const comment = seedJob({ command: '# sudo reboot\necho hi\n', started_at: isoAt(NOW - 5000000), finished_at: isoAt(NOW - 4999000) });
+  const winPs = seedJob({ client_id: 'c-3', client_name: 'win-box', interpreter: 'powershell', command: 'sudo foo\n', started_at: isoAt(NOW - 4000000), finished_at: isoAt(NOW - 3999000) });
+  const elevated = seedJob({ is_sudo: true, command: 'sudo apt-get update\n', started_at: isoAt(NOW - 3000000), finished_at: isoAt(NOW - 2999000) });
+  const oldUnknown = seedJob({ status: 'unknown', command: 'lsof', started_at: isoAt(NOW - 3 * 86400000), finished_at: isoAt(NOW - 3 * 86400000 + 60000) });
+
+  const h = histOf(await run(home, ['scripts', 'history']));
+  const r1 = runFor(h, J.j1.jid);
+  assert.ok(codes(r1).includes('MULTI_CLIENT') && r1.multi_targets === 2, '2 targets -> MULTI_CLIENT');
+  const s = runFor(h, single.jid);
+  assert.deepEqual([s.multi_job_id, s.multi_targets], ['multi-2', 1], 'multi fields kept');
+  assert.ok(!codes(s).includes('MULTI_CLIENT'), '1 target -> no MULTI_CLIENT');
+  assert.ok(codes(s).includes('INLINE_SUDO') && !codes(s).includes('SUDO'));
+  const rb = runFor(h, reboot.jid);
+  assert.ok(codes(rb).includes('STALE_RUNNING') && !codes(rb).includes('STILL_RUNNING'), 'months-old running is stale');
+  assert.match(rb.flags.find((f) => f.code === 'STALE_RUNNING').text, /never finalised.*disconnected, rebooted or lost the job/);
+  assert.ok(codes(rb).includes('INLINE_SUDO'));
+  const rc = runFor(h, recent.jid);
+  assert.ok(codes(rc).includes('STILL_RUNNING') && !codes(rc).includes('STALE_RUNNING'));
+  assert.ok(!codes(runFor(h, comment.jid)).includes('INLINE_SUDO'), 'sudo only in a comment');
+  assert.ok(!codes(runFor(h, winPs.jid)).includes('INLINE_SUDO'), 'ignored for cmd/powershell');
+  const el = runFor(h, elevated.jid);
+  assert.ok(codes(el).includes('SUDO') && !codes(el).includes('INLINE_SUDO'));
+  assert.match(runFor(h, oldUnknown.jid).flags.find((f) => f.code === 'UNKNOWN_MAY_STILL_RUN').text, /long past its timeout; check the client before assuming anything/);
+  assert.doesNotMatch(runFor(h, J.j4.jid).flags.find((f) => f.code === 'UNKNOWN_MAY_STILL_RUN').text, /long past/, 'recent unknown');
+  assert.deepEqual([h.summary.flags.MULTI_CLIENT, h.summary.flags.STALE_RUNNING, h.summary.flags.STILL_RUNNING, h.summary.flags.INLINE_SUDO], [1, 1, 1, 2]);
+  assert.match(h.summary.flag_legend.INLINE_SUDO, /client's sudo rules, not RPort's is_sudo/);
+  const md = fs.readFileSync(h.report_file, 'utf8');
+  const attention = md.slice(md.indexOf('## Attention'));
+  for (const re of [/\| STALE_RUNNING \| 1 \| status never finalised/, /\| INLINE_SUDO \| 2 \|/, /\| MULTI_CLIENT \| 1 \|/, /INLINE_SUDO: runs commands with sudo/]) assert.match(attention, re);
+  assert.match(md, /\| inline \|/, 'timeline marks inline sudo');
+  assert.deepEqual(writes(), []);
+});
+
+test('scripts job reuses history attribution, flags and UTC times', async () => {
+  const { home, J, T } = await historyHome();
+  let r = await run(home, ['scripts', 'job', 'win-box', J.j4.jid, '--json']);
+  assert.equal(r.code, 0, r.stderr);
+  let res = resultOf(r.stdout);
+  for (const c of ['INTERPRETER_OS_MISMATCH', 'NOT_FROM_LIBRARY', 'EMPTY_CLIENT_NAME', 'UNKNOWN_MAY_STILL_RUN']) assert.ok(codes(res.history).includes(c), c);
+  r = await run(home, ['scripts', 'job', 'my-server', J.j1.jid]);
+  assert.equal(r.code, 0, r.stderr);
+  res = resultOf(r.stdout);
+  assert.deepEqual([res.history.script.library_name, res.history.started_utc, res.history.remote_ip, res.history.multi_targets], ['disk-check', isoAt(T.j1), '198.51.100.9', 2]);
+  assert.match(r.stdout, /what: script disk-check@v1\/1/);
+  assert.match(r.stdout, /FLAG MULTI_CLIENT/);
+  assert.deepEqual(writes(), []);
+});
+
 test('no request ever went to an ad-hoc execution endpoint, and none can', () => {
   allLogs.push(...state.log, ...stateB.log);
   state.log = [];
@@ -1080,7 +1395,13 @@ test('no request ever went to an ad-hoc execution endpoint, and none can', () =>
   assert.ok(allLogs.some((e) => e.method === 'POST' && /\/clients\/c-1\/scripts$/.test(e.path)), 'the library run path was exercised');
   // Static: the source names no other execution endpoint, and every request goes through the guard.
   const src = fs.readFileSync(CLI, 'utf8');
-  assert.ok(!/['"`]\/commands['"`]/.test(src) && !/['"`]\/scripts['"`]/.test(src) && !/['"`]\/ws/.test(src), 'no literal ad-hoc endpoint');
+  const multi = src.match(/['"`]\/commands['"`]/g) || [];
+  assert.equal(multi.length, 1, 'the multi-job path is named exactly once');
+  assert.match(src, /\nconst MULTI_JOBS = '\/commands'; \/\/ multi-client jobs: read with GET only/);
+  const uses = src.split('\n').filter((l) => l.includes('MULTI_JOBS') && !l.startsWith('const MULTI_JOBS'));
+  assert.ok(uses.length > 0 && uses.every((l) => /getAllPages\(ctx, conn, MULTI_JOBS,|api\(ctx, conn, 'GET', `\$\{MULTI_JOBS\}\//.test(l)), `MULTI_JOBS only read: ${uses.join(' / ')}`);
+  assert.match(src, /async function getAllPages\([^)]*\) \{[\s\S]{0,200}await api\(ctx, conn, 'GET', p,/, 'getAllPages only GETs');
+  assert.ok(!/['"`]\/scripts['"`]/.test(src) && !/['"`]\/ws/.test(src), 'no literal ad-hoc endpoint');
   assert.equal((src.match(/await fetch\(/g) || []).length, 1, 'one fetch call site');
   assert.match(src, /async function api\([^)]*\) \{\n  assertAllowedRequest\(method, p\);/);
 });

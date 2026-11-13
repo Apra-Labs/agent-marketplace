@@ -1,6 +1,6 @@
 ---
 name: rport
-description: "Best practices and guardrails for working with RPort servers (rportd / openrport): tunnels, stored tunnels, the script library and running library scripts on a client, clients, users and remote access through the RPort API, run safely via apra-fleet so the agent never sees the API token. Use when the user mentions RPort, rportd or openrport, an RPort tunnel, stored tunnel, client, script or job, remote access to a device through RPort, running a script on an RPort client, asks to revive a tunnel, says a tunnel expired or closed, or says a tunnel port changed and a fleet member or SSH connection must follow it."
+description: "Best practices and guardrails for working with RPort servers (rportd / openrport): tunnels, stored tunnels, the script library and running library scripts on a client, clients, users and remote access through the RPort API, run safely via apra-fleet so the agent never sees the API token. Use when the user mentions RPort, rportd or openrport, an RPort tunnel, stored tunnel, client, script or job, remote access to a device through RPort, running a script on an RPort client, asks who ran a script or what a script run did, wants RPort job or run history explained, asks to revive a tunnel, says a tunnel expired or closed, or says a tunnel port changed and a fleet member or SSH connection must follow it."
 ---
 
 # RPort skill (core)
@@ -14,7 +14,7 @@ work is a chapter in `chapters/`. Read the chapter before acting in its area.
 | Chapter | Status | Covers |
 |---|---|---|
 | [tunnels](chapters/tunnels.md) | **available** | stored tunnels as definitions, revive, status, expiry bookkeeping, close, fleet-member links |
-| [scripts](chapters/scripts.md) | **available** | the server's script library, running a library script on one client (no ad-hoc code), job results |
+| [scripts](chapters/scripts.md) | **available** | the server's script library, running a library script on one client (no ad-hoc code), job results, **run-history analysis**: who ran which script (and version) where and when, and what it did |
 | clients | planned, not yet written | adding and registering clients, client auth |
 | users | planned, not yet written | users, groups, API tokens |
 

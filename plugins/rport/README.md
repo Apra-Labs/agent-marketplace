@@ -8,7 +8,8 @@ and any LLM provider that can call apra-fleet tools.
 The skill is chapter-based. **tunnels** is available: stored tunnels as definitions, revive with
 reuse, expiry bookkeeping, and repointing an apra-fleet member when a tunnel's port changes.
 **scripts** is available: browse the server script library and job results, and run a reviewed
-library script on one client on request (no ad-hoc code, no multi-client runs, sudo only when asked).
+library script on one client on request (no ad-hoc code, no multi-client runs, sudo only when asked),
+and explain run history read-only: who ran which script (and version) on which client, when, and with what result.
 **clients** and **users** are planned.
 
 The agent never sees your RPort API token. It stays in the apra-fleet credential store and reaches
