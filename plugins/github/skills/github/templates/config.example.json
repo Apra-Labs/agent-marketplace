@@ -1,0 +1,21 @@
+{
+  "identities": {
+    "fleet": { "source": "env", "host": "github.com", "env_var": "GH_TOKEN" },
+    "me": { "source": "gh-cli", "host": "github.com", "user": "your-login" },
+    "release-bot": {
+      "source": "app-key",
+      "host": "github.com",
+      "client_id": "Iv23liEXAMPLE",
+      "installation_id": 12345678,
+      "private_key_path": "/home/you/.config/github-skill/keys/release-bot.pem",
+      "repositories": ["your-repo"],
+      "permissions": { "contents": "read", "discussions": "write", "issues": "write", "pull_requests": "write" }
+    }
+  },
+  "default_identity": "fleet",
+  "repo_identity": {
+    "your-org/your-repo": "release-bot",
+    "your-org/*": "fleet"
+  },
+  "default_repo": "your-org/your-repo"
+}
