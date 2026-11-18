@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# Stop Claude Code background agents that still have a running process (an "id"
+# and a "pid" in "claude agents --json"). Works from bash and zsh on macOS, Linux
+# and Git Bash on Windows. Needs jq, python3 or python to read the JSON.
+#
+# Usage: stop-agents [-y|--yes] [-n|--dry-run] [-s|--state blocked,working]
+#   -y, --yes       stop without asking
+#   -n, --dry-run   only list what would be stopped
+#   -s, --state     additionally restrict to these states (comma-separated)
+# Never stops the session it runs in: when CLAUDE_CODE_SESSION_ID is set, the
+# agent with that sessionId is skipped. Interactive sessions (no id) are skipped too.
+# With no terminal to ask on and no -y, nothing is stopped: it says so and exits 0.
+# Conversations are kept: "claude attach <id>" or "claude --resume" reopens them.
+set -euo pipefail
+
+yes=0; dry=0; states=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -y|--yes) yes=1 ;;
+    -n|--dry-run) dry=1 ;;
+    -s|--state) shift; states="${1:-}" ;;
+    --state=*) states="${1#*=}" ;;
+    -h|--help) awk 'NR>1 && /^#/ {sub(/^# ?/,""); print; next} NR>1 {exit}' "$0"; exit 0 ;;
+    *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+json="$(claude agents --json)" || { echo "claude agents --json failed" >&2; exit 1; }
+
+SEP="$(printf '\037')"
+TAB="$(printf '\t')"
+
+# A python that really runs (on Windows "python3" can be a Microsoft Store stub).
+py=""
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1 && "$cand" -c "import json" >/dev/null 2>&1; then py="$cand"; break; fi
+done
+
+# Emit one line per background agent (has an id) with a pid:
+# id SEP pid SEP state SEP status SEP name SEP sessionId
+# Interactive sessions have a pid but no id; claude stop can't stop them.
+if command -v jq >/dev/null 2>&1; then
+  rows="$(printf '%s' "$json" | jq -r --arg s "$states" '
+    ($s | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(. != ""))) as $want
+    | .[] | select(.pid != null and (.id // "") != "")
+    | select(($want | length) == 0 or (.state as $st | $want | index($st)))
+    | [.id, (.pid|tostring), .state, (.status // ""), .name, (.sessionId // "")] | join("\u001f")' | tr -d '\r')"
+elif [ -n "$py" ]; then
+  rows="$(printf '%s' "$json" | STATES="$states" "$py" -c '
+import json, os, sys
+want = [s.strip() for s in os.environ["STATES"].split(",") if s.strip()]
+for a in json.load(sys.stdin):
+    if a.get("id") and a.get("pid") and (not want or a.get("state") in want):
+        sys.stdout.write(chr(31).join(str(a.get(k) or "") for k in ("id", "pid", "state", "status", "name", "sessionId")) + "\n")
+' | tr -d '\r')"
+else
+  echo "need jq, python3 or python to parse JSON" >&2; exit 1
+fi
+
+# Drop the current session; build the display table and the list of ids to stop.
+me="${CLAUDE_CODE_SESSION_ID:-}"
+ids=""; display=""; count=0
+while IFS="$SEP" read -r id pid state status name sid; do
+  [ -n "$id" ] || continue
+  if [ -n "$me" ] && [ "$sid" = "$me" ]; then
+    echo "Skipping $id ($name): this is the current session."
+    continue
+  fi
+  count=$((count + 1))
+  ids="$ids$id$TAB$name
+"
+  display="$display$id$TAB$pid$TAB${state:--}$TAB${status:--}$TAB${name:--}
+"
+done <<EOF
+$rows
+EOF
+
+if [ "$count" -eq 0 ]; then echo "No background agents with a running process (pid) found."; exit 0; fi
+
+echo "Found $count background agent(s) with a running process:"
+if command -v column >/dev/null 2>&1; then
+  { printf 'ID\tPID\tSTATE\tSTATUS\tNAME\n'; printf '%s' "$display"; } | column -t -s "$TAB"
+else
+  { printf 'ID\tPID\tSTATE\tSTATUS\tNAME\n'; printf '%s' "$display"; }
+fi
+echo
+
+if [ "$dry" -eq 1 ]; then echo "Dry run: nothing stopped."; exit 0; fi
+
+if [ "$yes" -ne 1 ]; then
+  answer=""
+  if ! { printf 'Stop all of them? [y/N] ' >/dev/tty; read -r answer </dev/tty; } 2>/dev/null; then
+    echo "No terminal to confirm; rerun with -y to stop them."
+    exit 0
+  fi
+  case "$answer" in y|Y|yes|YES) ;; *) echo "Aborted."; exit 0 ;; esac
+fi
+
+failed=0
+while IFS="$TAB" read -r id name; do
+  [ -n "$id" ] || continue
+  printf 'Stopping %s (%s)... ' "$id" "$name"
+  if claude stop "$id" >/dev/null 2>&1; then echo "ok"; else echo "failed"; failed=$((failed + 1)); fi
+done <<EOF
+$ids
+EOF
+
+echo "Done: $((count - failed)) stopped, $failed failed."
+[ "$failed" -eq 0 ]

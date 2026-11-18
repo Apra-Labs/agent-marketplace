@@ -54,6 +54,20 @@
         "sub-issues",
         "apra-fleet"
       ]
+    },
+    {
+      "name": "stop-agents",
+      "source": "./plugins/stop-agents",
+      "description": "Stops Claude Code background agents with one command, inside Claude (/stop-agents:stop) or from any terminal (stop-agents). Never stops its own session. The bash version needs jq, python3 or python.",
+      "version": "0.1.0",
+      "category": "productivity",
+      "keywords": [
+        "agents",
+        "background-agents",
+        "stop",
+        "cli",
+        "windows"
+      ]
     }
   ]
 }
