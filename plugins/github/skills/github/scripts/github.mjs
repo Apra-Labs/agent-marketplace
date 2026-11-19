@@ -77,6 +77,20 @@ export function stateDir() {
   return process.env.GITHUB_SKILL_HOME || path.join(os.homedir(), '.config', 'github-skill');
 }
 const configPath = () => path.join(stateDir(), 'config.json');
+
+// Actions logs go to a per-user cache outside any repo checkout (never the CWD), owner-only where the OS
+// supports modes. Content is redacted before it is written.
+export function defaultLogDir() {
+  return path.join(os.homedir(), '.cache', 'apra-github', 'logs');
+}
+export function writeLogFile(dir, name, text, ownerOnlyDir = true) {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (ownerOnlyDir) { try { fs.chmodSync(dir, 0o700); } catch { /* not supported on this OS */ } }
+  const p = path.join(dir, name);
+  fs.writeFileSync(p, redact(text), { mode: 0o600 });
+  try { fs.chmodSync(p, 0o600); } catch { /* not supported on this OS */ }
+  return p;
+}
 const IDENTITY_FIELDS = {
   env: ['source', 'host', 'env_var'],
   'gh-cli': ['source', 'host', 'user'],
@@ -132,8 +146,29 @@ function saveConfig(cfg) {
   return clean;
 }
 
-export function apiBase(host) {
+// GITHUB_API_URL overrides the API host only for an `env` identity (the token and the URL come from the
+// same environment, as in GitHub Actions) or when its host is the identity's own host (api.<host> counts).
+// For any other identity it is ignored with a warning, so a stray value cannot send a gh-cli or App token
+// to another host. With no identity (ident omitted) nothing is authenticated, and it is honoured.
+const warnedApiUrl = new Set();
+export function apiUrlAllowed(rawUrl, ident) {
+  if (!ident || !ident.def) return true;
+  if (ident.def.source === 'env') return true;
+  let u;
+  try { u = new URL(rawUrl); } catch { return true; } // invalid: apiBase reports it
+  const host = String(ident.def.host || 'github.com').toLowerCase();
+  const h = u.host.toLowerCase();
+  return h === host || h === `api.${host}`;
+}
+export function apiBase(host, ident) {
   let raw = process.env.GITHUB_API_URL;
+  if (raw && !apiUrlAllowed(raw, ident)) {
+    if (!warnedApiUrl.has(ident.name)) {
+      warnedApiUrl.add(ident.name);
+      process.stderr.write(`warning: GITHUB_API_URL (host ${new URL(raw).host}) ignored for identity "${ident.name}" (source ${ident.def.source}, host ${ident.def.host || 'github.com'}); it applies only to env identities or the identity's own host.\n`);
+    }
+    raw = '';
+  }
   if (!raw) raw = host && host !== 'github.com' ? `https://${host}/api/v3` : DEFAULT_API;
   let u;
   try { u = new URL(raw); } catch { throw cfgErr(`GITHUB_API_URL "${raw}" is not a valid URL.`); }
@@ -274,7 +309,7 @@ function makeCtx(flags) {
 function identityFor(ctx, repo) {
   if (!ctx.ident) {
     ctx.ident = resolveIdentity(ctx.cfg, { flag: ctx.f.identity, repo });
-    ctx.base = apiBase(ctx.ident.def.host);
+    ctx.base = apiBase(ctx.ident.def.host, ctx.ident);
   }
   return ctx.ident;
 }
@@ -387,7 +422,7 @@ const writeGap = () => {
 
 // One HTTP request with an explicit Authorization header (used for the App token mint too).
 async function rawRequest(ctx, method, p, { query, body, authHeader, raw = false, allow = [], accept } = {}) {
-  if (!ctx.base) ctx.base = apiBase(ctx.ident && ctx.ident.def.host);
+  if (!ctx.base) ctx.base = apiBase(ctx.ident && ctx.ident.def.host, ctx.ident);
   const url = buildUrl(ctx, p, query);
   const apiOrigin = new URL(ctx.base).origin;
   let retried = false;
@@ -1733,7 +1768,7 @@ async function cmdActions(ctx, a) {
       if (!cur || Date.parse(r.created_at) > Date.parse(cur.created_at) || (r.created_at === cur.created_at && r.id > cur.id)) newest.set(k, r);
     }
     const failed = [...newest.values()].filter((r) => FAILED_RUN.has(r.conclusion));
-    const outDir = path.resolve(f.out || '.github-logs');
+    const outDir = f.out ? path.resolve(f.out) : defaultLogDir();
     const report = { repo: repo.full, head, workflows_seen: newest.size, failed_runs: [], passing_or_other: [...newest.values()].filter((r) => !FAILED_RUN.has(r.conclusion)).map((r) => ({ workflow: r.path || r.name, conclusion: r.conclusion, run_id: r.id })), out_dir: outDir };
     for (const run of failed) {
       const jobs = (await paginate(ctx, `${repo.rp}/actions/runs/${run.id}/jobs`, { query: { filter: 'latest' }, key: 'jobs', limit: 500, maxPages: 5 })).values;
@@ -1744,10 +1779,8 @@ async function cmdActions(ctx, a) {
         let logText = null;
         try {
           const lr = await api(ctx, 'GET', `${repo.rp}/actions/jobs/${job.id}/logs`, { raw: true });
-          fs.mkdirSync(outDir, { recursive: true });
-          jr.log_file = path.join(outDir, `${run.id}-${job.id}.log`);
-          fs.writeFileSync(jr.log_file, lr.buffer);
-          logText = lr.text;
+          logText = redact(lr.text);
+          jr.log_file = writeLogFile(outDir, `${run.id}-${job.id}.log`, logText, !f.out);
         } catch (e) {
           if (!(e instanceof CliError) || e.exitCode === EXIT.AUTH || e.exitCode === EXIT.CONFIG) throw e;
           jr.log_error = e.status === 410 || e.status === 404 ? 'log expired or not available (GitHub keeps logs for a limited retention period)' : redact(e.message);
@@ -2011,7 +2044,7 @@ Issues (gaps only):
 Actions:
   actions failures -R o/r (--branch B | --pr N | --sha S) [--workflow FILE] [--out DIR]
       newest run per workflow, failed jobs/steps, step log tail + error lines, annotations;
-      full logs saved to DIR (default .github-logs/)
+      full logs (redacted) saved to DIR (default ~/.cache/apra-github/logs/, outside any repo)
   actions rerun -R o/r <run-id> [--failed-only (default) | --all] [--debug]   (--debug = enable_debug_logging)
   actions rerun-job -R o/r <job-id> [--debug]
   actions dispatch -R o/r <workflow-file> --ref R [--input k=v ...]   inputs validated against the workflow
@@ -2019,7 +2052,7 @@ Actions:
 Global: -R owner/repo  --identity NAME  --dry-run (writes print method/url/body, nothing sent)
         --json (compact)  --debug (redacted request trace)  --no-lint
 Env: GH_TOKEN / GITHUB_TOKEN (env identity), GITHUB_SKILL_HOME (config dir, default ~/.config/github-skill),
-     GITHUB_API_URL (default ${DEFAULT_API}; GraphQL at <base>/graphql), GITHUB_SKILL_GH_BIN (gh binary)
+     GITHUB_API_URL (default ${DEFAULT_API}; GraphQL at <base>/graphql; only for env identities or the identity's own host), GITHUB_SKILL_GH_BIN (gh binary)
 Exit codes: 0 ok, 1 usage, 2 guardrail refusal, 3 API error, 4 config error, 5 auth problem.`;
 
 const BOOL_FLAGS = new Set(['dry-run', 'debug', 'json', 'help', 'no-lint', 'allow-duplicate', 'replace-answer', 'answered', 'unanswered', 'pending', 'unresolved', 'failed-only', 'all', 'replace-parent']);

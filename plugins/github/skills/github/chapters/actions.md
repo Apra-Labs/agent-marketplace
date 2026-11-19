@@ -11,7 +11,8 @@ read (triage), Actions write (re-run, dispatch).
 <run> actions failures -R o/r --pr <n>            # or --branch <b> | --sha <sha>, [--workflow ci.yml]
 ```
 For the newest failed run of each workflow on that head, the script finds the failed jobs and the
-**failed steps**, downloads each failed job's log to `.github-logs/` and prints, per failed step,
+**failed steps**, saves each failed job's log (redacted) under `~/.cache/apra-github/logs/`, outside
+any repo checkout (or `--out DIR`), and prints, per failed step,
 the last lines plus the lines that look like errors, and the job's annotations (file:line
 messages from compilers, linters and test reporters).
 
