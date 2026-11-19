@@ -27,14 +27,31 @@
     {
       "name": "rport",
       "source": "./plugins/rport",
-      "description": "Guardrails for RPort servers (rportd/openrport): stored tunnels, revive, expiry, repointing fleet members; the API token stays in apra-fleet. Requires apra-fleet 0.4.4+ and Node.js 18+.",
-      "version": "0.2.0",
+      "description": "Guardrails for RPort servers (rportd/openrport): stored tunnels, revive, expiry, repointing fleet members, running reviewed library scripts on one client, and explaining script run history (who, what, when, effects); the API token stays in apra-fleet. Requires apra-fleet 0.4.4+ and Node.js 18+.",
+      "version": "0.4.0",
       "category": "devops",
       "keywords": [
         "rport",
         "openrport",
         "tunnels",
         "remote-access",
+        "apra-fleet",
+        "scripts"
+      ]
+    },
+    {
+      "name": "github",
+      "source": "./plugins/github",
+      "description": "The GitHub work agents get wrong, done safely: explicit identity (fleet secret, fleet GitHub App, gh login or App key), Discussions and a Discussions FAQ, PR review threads and valid inline comments, sub-issues and issue types, Actions failure triage. Complements gh. Requires Node.js 18+.",
+      "version": "0.1.0",
+      "category": "devops",
+      "keywords": [
+        "github",
+        "discussions",
+        "faq",
+        "code-review",
+        "github-actions",
+        "sub-issues",
         "apra-fleet"
       ]
     }
