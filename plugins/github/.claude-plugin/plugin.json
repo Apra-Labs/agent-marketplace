@@ -1,6 +1,6 @@
 {
   "name": "github",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "The GitHub work agents get wrong, done safely: explicit identity (fleet secret, fleet GitHub App, gh login or App key), Discussions and a Discussions FAQ, PR review threads and valid inline comments, sub-issues and issue types, Actions failure triage. Complements gh. Requires Node.js 18+.",
   "author": {
     "name": "Apra Labs",

@@ -2,6 +2,7 @@
 
 One line per plugin release, newest first.
 
+- github 0.1.1 (fix) - token handling: `GITHUB_API_URL` now applies only to env identities or the identity's own host (ignored with a warning otherwise, so a gh-cli or App token cannot be sent elsewhere); Actions logs are redacted and saved under `~/.cache/apra-github/logs/` (owner-only) instead of `.github-logs/` in the current directory; regression test that the App JWT is redacted as soon as it is minted.
 - github 0.1.0 - first release: a supplement to gh covering identity selection, Discussions + FAQ (replaces the standalone github-discussions-faq skill), PR review mechanics, sub-issues/issue types/duplicates, Actions failure triage; zero-dependency script.
 - rport 0.4.0 - read-only run-history analysis (`scripts history`): joins job details, multi-jobs, the audit log and library edit history into one timeline per run - who, from where, which library script and version, client and OS, privileges, outcome - with anomaly flags (e.g. a POSIX script run under cmd on Windows) and a Markdown report; effects are inferred from script text and output, never by running anything.
 - rport 0.3.0 - scripts chapter: browse the server script library and job results; run a library script on one client on request (dry run first, sudo only when asked); no ad-hoc code, no multi-client runs.

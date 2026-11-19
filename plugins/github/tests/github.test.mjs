@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 import {
   resolveIdentity, tokenKind, mintAppJwt, lintMarkdown, parseFaqIndex, appendToIndex, parsePatch, compactRanges,
   validateReviewComments, suggestionBody, parseDispatchInputs, validateDispatchInputs, extractStepLog, diagnoseApiError,
-  diagnoseGraphqlErrors, parseArgs, titleSimilarity, unifiedDiff, EXIT,
+  diagnoseGraphqlErrors, parseArgs, titleSimilarity, unifiedDiff, EXIT, apiBase, apiUrlAllowed, redact, defaultLogDir,
 } from '../skills/github/scripts/github.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -304,7 +304,7 @@ const server = http.createServer((req, res) => {
 const storage = http.createServer((req, res) => {
   state.storageLog.push({ path: req.url, auth: req.headers.authorization || '' });
   res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end(JOB_LOG);
+  res.end(JOB_LOG + (state.jobLogExtra || ''));
 });
 
 const homes = [];
@@ -394,6 +394,39 @@ test('App JWT: RS256, iat = now-60, exp = now+540, iss = client_id || app_id, si
   assert.deepEqual(v.payload, { iat: now - 60, exp: now + 540, iss: 12345 });
   v = verifyJwt(mintAppJwt({ appId: 1, clientId: 'Iv23abc', privateKeyPem: PRIV_PEM, now }));
   assert.equal(v.payload.iss, 'Iv23abc');
+});
+
+test('App JWT is registered for redaction as soon as it is minted', () => {
+  const jwt = mintAppJwt({ appId: '424242', privateKeyPem: PRIV_PEM, now: 1_800_000_123 });
+  assert.equal(redact(`before ${jwt} after`), 'before [REDACTED] after');
+  assert.ok(!redact(`x=${encodeURIComponent(jwt)}`).includes(jwt));
+});
+
+test('GITHUB_API_URL applies only to env identities or the identity\'s own host; otherwise ignored with a warning', () => {
+  const ident = (source, host = 'github.com', name = 'n') => ({ name, def: { source, host } });
+  assert.equal(apiUrlAllowed('https://evil.example/api', ident('env')), true);
+  assert.equal(apiUrlAllowed('https://evil.example/api', ident('gh-cli')), false);
+  assert.equal(apiUrlAllowed('https://evil.example/api', ident('app-key')), false);
+  assert.equal(apiUrlAllowed('https://api.github.com', ident('gh-cli')), true);
+  assert.equal(apiUrlAllowed('https://ghe.example.test/api/v3', ident('gh-cli', 'ghe.example.test')), true);
+  assert.equal(apiUrlAllowed('https://evil.example/api', undefined), true, 'no identity: nothing is authenticated');
+  const saved = process.env.GITHUB_API_URL;
+  const write = process.stderr.write;
+  let err = '';
+  process.stderr.write = (s) => { err += s; return true; };
+  try {
+    process.env.GITHUB_API_URL = 'https://evil.example/api';
+    assert.equal(apiBase('github.com', ident('gh-cli', 'github.com', 'cli-a')), 'https://api.github.com');
+    assert.equal(apiBase('ghe.example.test', ident('app-key', 'ghe.example.test', 'app-b')), 'https://ghe.example.test/api/v3');
+    assert.equal(apiBase('github.com', ident('env', 'github.com', 'env-c')), 'https://evil.example/api');
+  } finally {
+    process.stderr.write = write;
+    if (saved === undefined) delete process.env.GITHUB_API_URL; else process.env.GITHUB_API_URL = saved;
+  }
+  assert.match(err, /GITHUB_API_URL \(host evil\.example\) ignored for identity "cli-a" \(source gh-cli/);
+  assert.match(err, /ignored for identity "app-b"/);
+  assert.doesNotMatch(err, /env-c/);
+  assert.ok(!err.includes(SENTINEL));
 });
 
 test('parseArgs: inline bodies and tokens are guardrail refusals; unknown flags are usage errors', () => {
@@ -612,7 +645,8 @@ test('gh-cli identity: runs gh auth token --hostname --user without shell and wi
   const ghDir = newHome();
   const logFile = path.join(ghDir, 'gh-args.json');
   const fakeGh = writeFile(ghDir, 'gh.mjs', `import fs from 'node:fs';\nfs.writeFileSync(process.env.FAKE_GH_LOG, JSON.stringify({ args: process.argv.slice(2), sawGhToken: !!(process.env.GH_TOKEN || process.env.GITHUB_TOKEN) }));\nprocess.stdout.write(process.env.FAKE_GH_TOKEN + '\\n');\n`);
-  let r = await run(home, ['config', 'identity', 'add', 'me', '--source', 'gh-cli', '--user', 'cli-user']);
+  // the identity's host is the fake server's, so GITHUB_API_URL (pointing there) is honoured for it
+  let r = await run(home, ['config', 'identity', 'add', 'me', '--source', 'gh-cli', '--host', new URL(BASE).host, '--user', 'cli-user']);
   assert.equal(r.code, 0, r.stderr);
   r = await run(home, ['config', 'map', 'acme/*', 'me']);
   assert.equal(r.code, 0, r.stderr);
@@ -624,7 +658,7 @@ test('gh-cli identity: runs gh auth token --hostname --user without shell and wi
   assert.equal(w.actor.login, 'cli-user');
   assert.match(w.selected_via, /acme\/\*/);
   const g = JSON.parse(fs.readFileSync(logFile, 'utf8'));
-  assert.deepEqual(g.args, ['auth', 'token', '--hostname', 'github.com', '--user', 'cli-user']);
+  assert.deepEqual(g.args, ['auth', 'token', '--hostname', new URL(BASE).host, '--user', 'cli-user']);
   assert.equal(g.sawGhToken, false);
   assert.ok(state.log.every((e) => e.auth === `Bearer ${CLI_TOKEN}`));
 });
@@ -633,7 +667,7 @@ test('app-key identity: JWT verified by the server, installation token minted wi
   const home = newHome();
   const keyDir = newHome();
   const keyPath = writeFile(keyDir, 'app.pem', PRIV_PEM);
-  let r = await run(home, ['config', 'identity', 'add', 'bot', '--source', 'app-key', '--app-id', '12345', '--installation-id', '77', '--private-key-path', keyPath, '--repositories', 'app', '--permissions', 'issues=write,discussions=write']);
+  let r = await run(home, ['config', 'identity', 'add', 'bot', '--source', 'app-key', '--host', new URL(BASE).host, '--app-id', '12345', '--installation-id', '77', '--private-key-path', keyPath, '--repositories', 'app', '--permissions', 'issues=write,discussions=write']);
   assert.equal(r.code, 0, r.stderr);
   r = await run(home, ['auth', 'whoami', '--identity', 'bot']);
   assert.equal(r.code, 0, r.stderr);
@@ -1011,6 +1045,29 @@ test('actions failures: newest run per workflow, failed steps with log tail + er
   assert.match(runsReq.url, /status=completed/);
   const jobsReq = state.log.find((e) => e.path.endsWith('/runs/501/jobs'));
   assert.match(jobsReq.url, /filter=latest/);
+});
+
+test('actions failures: by default logs go to the per-user cache (not the CWD), redacted, owner-only', async () => {
+  const home = newHome();
+  const other = 'ghp_' + 'FAKEfake'.repeat(5);
+  state.jobLogExtra = `\n2026-11-16T10:01:11.0000000Z leaked ${SENTINEL} and ${other}\n`;
+  const r = await run(home, ['actions', 'failures', ...R, '--pr', '5'], { HOME: home, USERPROFILE: home });
+  assert.equal(r.code, 0, r.stderr);
+  const x = json(r);
+  const dir = path.join(home, '.cache', 'apra-github', 'logs');
+  assert.equal(x.out_dir, dir);
+  const file = x.failed_runs[0].failed_jobs[0].log_file;
+  assert.equal(file, path.join(dir, '501-601.log'));
+  assert.ok(!fs.existsSync(path.join(home, '.github-logs')), 'nothing written to the CWD');
+  const text = fs.readFileSync(file, 'utf8');
+  assert.ok(!text.includes(SENTINEL) && !text.includes(other), 'tokens redacted in the saved log');
+  assert.match(text, /leaked \[REDACTED\] and \[REDACTED\]/);
+  assert.match(text, /Error: expected 1 to equal 2/);
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+    assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  }
+  assert.equal(path.basename(path.dirname(defaultLogDir())), 'apra-github');
 });
 
 test('actions rerun: 30-day and 50-attempt guards; failed-only default, --all, --debug sets enable_debug_logging', async () => {
