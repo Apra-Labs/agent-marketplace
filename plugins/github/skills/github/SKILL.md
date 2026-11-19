@@ -54,4 +54,4 @@ error, `5` authentication problem (the message says what is wrong and what fixes
   badly (see the discussions chapter).
 - **Public by default:** discussions, comments and reviews on public repos are public. No internal
   names, ticket numbers, hostnames, credentials or private conversation in them.
-- **Logs go to files** (`.github-logs/`); read the failing parts, don't paste whole logs.
+- **Logs go to files** (`~/.cache/apra-github/logs/`, redacted, outside the repo); read the failing parts, don't paste whole logs.
