@@ -236,7 +236,8 @@ after(async () => {
 beforeEach(() => resetState());
 
 function newHome() {
-  const h = fs.mkdtempSync(path.join(os.tmpdir(), 'rps-'));
+  // realpath: on macOS os.tmpdir() is under /var, a symlink to /private/var, and a child's cwd is the real path
+  const h = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), 'rps-')));
   homes.push(h);
   return h;
 }
