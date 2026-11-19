@@ -42,10 +42,18 @@ function write(root, files) {
   }
 }
 
+// git in a throwaway repo, without a shell; identity passed per command (CI runners have none configured)
+const gitIn = (dir) => (...a) => execFileSync('git', ['-C', dir, '-c', 'user.name=t', '-c', 'user.email=t@example.com', ...a], { stdio: 'pipe' });
+
+// A committed git checkout of the source: the sync reads only git-tracked content.
 function makeSource(t, version = '1.2.3', pin = version) {
   const root = tmp(t);
   write(root, { 'pyproject.toml': `[project]\nname = "x"\nversion = "${version}"\n` });
   write(path.join(root, 'marketplace-plugin'), pluginFiles(version, pin));
+  const g = gitIn(root);
+  g('init', '-q');
+  g('add', '-A');
+  g('commit', '-q', '-m', 'x');
   return root;
 }
 
@@ -109,11 +117,7 @@ test('a later release updates in place and removes what the source removed', (t)
 
 test('--ref reads the plugin from git and records the commit', (t) => {
   const source = makeSource(t);
-  const g = (...a) => execFileSync('git', ['-C', source, '-c', 'user.name=t', '-c', 'user.email=t@example.com', ...a], { stdio: 'pipe' });
-  g('init');
-  g('add', '-A');
-  g('commit', '-m', 'x');
-  g('tag', 'v1.2.3');
+  gitIn(source)('tag', 'v1.2.3');
   write(path.join(source, 'marketplace-plugin'), { 'README.md': 'changed after the tag' });
   const root = makeMarketplace(t);
   sync({ source, ref: 'v1.2.3', root, log: quiet });
@@ -124,12 +128,44 @@ test('--ref reads the plugin from git and records the commit', (t) => {
 
 test('refuses a tag holding another version', (t) => {
   const source = makeSource(t);
-  const g = (...a) => execFileSync('git', ['-C', source, '-c', 'user.name=t', '-c', 'user.email=t@example.com', ...a], { stdio: 'pipe' });
-  g('init');
-  g('add', '-A');
-  g('commit', '-m', 'x');
-  g('tag', 'v9.9.9');
+  gitIn(source)('tag', 'v9.9.9');
   assert.throws(() => sync({ source, ref: 'v9.9.9', root: makeMarketplace(t), log: quiet }), /tag v9\.9\.9 holds version 1\.2\.3/);
+});
+
+test('without --ref only HEAD is read: untracked, ignored and uncommitted files never reach the marketplace', (t) => {
+  const source = makeSource(t);
+  const plugin = path.join(source, 'marketplace-plugin');
+  write(source, { '.gitignore': 'secrets.txt\n' });
+  gitIn(source)('add', '.gitignore');
+  gitIn(source)('commit', '-q', '-m', 'ignore');
+  write(plugin, {
+    '.env': 'API_KEY=fake-not-a-real-key-0000\n', // untracked
+    'secrets.txt': 'fake-ignored-secret\n', // ignored
+    'notes/draft.md': 'untracked draft\n',
+    LICENSE: 'edited but not committed\n', // tracked, modified
+  });
+  const root = makeMarketplace(t);
+  const logs = [];
+  sync({ source, root, log: (m) => logs.push(m) });
+  const dest = path.join(root, 'plugins', 'redactor');
+  for (const f of ['.env', 'secrets.txt', 'notes']) assert.ok(!fs.existsSync(path.join(dest, f)), `${f} must not be copied`);
+  assert.equal(fs.readFileSync(path.join(dest, 'LICENSE'), 'utf8'), 'Apache License\n', 'committed content, not the working tree');
+  const all = JSON.stringify([...fs.readdirSync(dest, { recursive: true })].map(String));
+  assert.ok(!all.includes('.env'), all);
+  assert.match(fs.readFileSync(path.join(dest, 'GENERATED.md'), 'utf8'), /ref HEAD, commit [0-9a-f]{40}/);
+  assert.ok(logs.some((m) => /4 uncommitted, untracked or ignored path\(s\)/.test(m)), logs.join('\n'));
+  assert.ok(!logs.join('\n').includes('fake-not-a-real-key'), 'file contents are never logged');
+  // --check agrees with what HEAD holds, whatever the working tree has
+  assert.equal(sync({ source, root, check: true, log: quiet }).ok, true);
+});
+
+test('a source that is not a git checkout is refused, nothing is copied', (t) => {
+  const source = tmp(t);
+  write(source, { 'pyproject.toml': '[project]\nname = "x"\nversion = "1.2.3"\n' });
+  write(path.join(source, 'marketplace-plugin'), pluginFiles());
+  const root = makeMarketplace(t);
+  assert.throws(() => sync({ source, root, log: quiet }), /cannot read HEAD .* git checkout/);
+  assert.ok(!fs.existsSync(path.join(root, 'plugins')));
 });
 
 test('version rules', () => {

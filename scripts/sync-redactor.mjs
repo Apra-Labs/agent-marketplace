@@ -6,9 +6,12 @@
 //
 //   node scripts/sync-redactor.mjs [SOURCE] [--ref REF] [--check]
 //
-// SOURCE  a local checkout of apra-redactor-mcp (default: ../apra-redactor-mcp next to this repo)
-// --ref   copy the plugin as of this git ref (e.g. v0.1.0) instead of SOURCE's working tree
+// SOURCE  a local git checkout of apra-redactor-mcp (default: ../apra-redactor-mcp next to this repo)
+// --ref   copy the plugin as of this git ref (e.g. v0.1.0); default HEAD
 // --check change nothing; exit 1 if the marketplace differs from what a sync would write
+//
+// Only git-tracked content at the ref is read (git ls-tree + git show, no shell): untracked,
+// ignored or uncommitted files in SOURCE (a .env, local notes) are never copied into this public repo.
 //
 // The sync refuses unless the plugin.json version and the package version in pyproject.toml agree,
 // .mcp.json connects to the local service, and README.md's docker commands pin exactly that image
@@ -52,24 +55,30 @@ function readTree(dir, prefix = '') {
   return out;
 }
 
-/** Plugin files (relative path -> Buffer) and the package version, from a working tree or a ref. */
-export function readSource(source, ref) {
+/**
+ * Plugin files (relative path -> Buffer) and the package version, from git-tracked content at `ref`
+ * (default HEAD). The working tree is never read, so untracked or ignored files cannot leak.
+ */
+export function readSource(source, ref = 'HEAD') {
   const files = new Map();
+  let names;
+  try {
+    // SOURCE must be the top of its own checkout, not a folder inside some other repository
+    if (git(source, ['rev-parse', '--show-cdup']).toString().trim() !== '') throw new Error(`${source} is not the top level of a git checkout`);
+    // regular files and symlinks only (mode 100644/100755/120000); a submodule (160000) has no content here
+    names = git(source, ['ls-tree', '-r', '-z', '--full-tree', ref, '--', `${SRC_DIR}/`]).toString('utf8').split('\0').filter(Boolean)
+      .map((line) => /^(\d+) (\w+) [0-9a-f]+\t(.*)$/s.exec(line))
+      .filter((m) => m && m[2] === 'blob')
+      .map((m) => m[3]);
+  } catch (e) {
+    throw new SyncError(`cannot read ${ref} in ${source} (it must be a git checkout of ${PACKAGE}): ${String(e.stderr || e.message).trim()}`);
+  }
+  for (const name of names) files.set(name.slice(SRC_DIR.length + 1), normalize(git(source, ['show', `${ref}:${name}`])));
   let pyproject;
-  if (ref) {
-    let names;
-    try {
-      names = git(source, ['ls-tree', '-r', '-z', '--name-only', ref, '--', `${SRC_DIR}/`]).toString('utf8').split('\0').filter(Boolean);
-    } catch (e) {
-      throw new SyncError(`cannot read ${ref} in ${source}: ${String(e.stderr || e.message).trim()}`);
-    }
-    for (const name of names) files.set(name.slice(SRC_DIR.length + 1), normalize(git(source, ['show', `${ref}:${name}`])));
+  try {
     pyproject = git(source, ['show', `${ref}:pyproject.toml`]).toString('utf8');
-  } else {
-    const dir = path.join(source, SRC_DIR);
-    if (!fs.existsSync(dir)) throw new SyncError(`${dir} not found: is ${source} a checkout of ${PACKAGE}?`);
-    for (const [k, v] of readTree(dir)) files.set(k, v);
-    pyproject = fs.readFileSync(path.join(source, 'pyproject.toml'), 'utf8');
+  } catch {
+    throw new SyncError(`pyproject.toml is not tracked at ${ref} in ${source}`);
   }
   if (!files.size) throw new SyncError(`no ${SRC_DIR}/ in ${source}${ref ? ` at ${ref}` : ''}`);
   const m = /^\[project\][\s\S]*?^version\s*=\s*"([^"]+)"/m.exec(pyproject);
@@ -98,12 +107,19 @@ export function checkVersions(files, packageVersion) {
 
 function commitOf(source, ref) {
   try {
-    const sha = git(source, ['rev-parse', '--verify', `${ref || 'HEAD'}^{commit}`]).toString().trim();
-    if (ref) return sha;
-    const dirty = git(source, ['status', '--porcelain', '--', SRC_DIR, 'pyproject.toml']).toString().trim();
-    return dirty ? `${sha} + uncommitted changes` : sha;
+    return git(source, ['rev-parse', '--verify', `${ref}^{commit}`]).toString().trim();
   } catch {
-    return 'unknown (not a git checkout)';
+    return 'unknown';
+  }
+}
+
+// Paths under SRC_DIR (or pyproject.toml) that differ from HEAD or are untracked/ignored: they are not synced.
+function uncommitted(source) {
+  try {
+    return git(source, ['status', '--porcelain', '-z', '--ignored', '--untracked-files=all', '--', SRC_DIR, 'pyproject.toml'])
+      .toString('utf8').split('\0').filter(Boolean).length;
+  } catch {
+    return 0;
   }
 }
 
@@ -115,7 +131,7 @@ repository by \`scripts/sync-redactor.mjs\`. Edits made here are overwritten by 
 sync: change the source repository and re-run the sync.
 
 - version: ${version}
-- source: ${ref ? `ref ${ref}, ` : 'working tree, '}commit ${commit}
+- source: ref ${ref}, commit ${commit}
 - server: Docker image \`${IMAGE}:${version}\`, as one always-on local service
 `;
 }
@@ -169,9 +185,13 @@ function sameContent(a, b, ignore = []) {
   return true;
 }
 
-/** Sync the plugin from `source` (at `ref`, if given) into the marketplace at `root`. */
-export function sync({ source, ref, root = repoRoot, check = false, log = console.log }) {
+/** Sync the plugin from `source` at `ref` (default HEAD; git-tracked content only) into the marketplace at `root`. */
+export function sync({ source, ref = 'HEAD', root = repoRoot, check = false, log = console.log }) {
   const { files, packageVersion } = readSource(source, ref);
+  if (ref === 'HEAD') {
+    const n = uncommitted(source);
+    if (n) log(`Note: ${n} uncommitted, untracked or ignored path(s) under ${SRC_DIR}/ in ${source} are not synced (only HEAD is read).`);
+  }
   let version;
   try {
     version = checkVersions(files, packageVersion);
