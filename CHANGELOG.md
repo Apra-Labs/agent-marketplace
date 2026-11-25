@@ -2,6 +2,7 @@
 
 One line per plugin release, newest first.
 
+- password-gen 0.1.0 - first release: cross-platform generator (Windows/macOS/Linux) that never prints the password unless --echo; clipboard with auto-clear, OSC 52 over SSH.
 - stop-agents 0.1.0 - first release: stops Claude Code background agents with one command (`/stop-agents:stop` in Claude, or `stop-agents` from any terminal via `/stop-agents:install-cli`); bash, cmd and PowerShell versions; skips its own session and interactive sessions; no stop without confirmation or `-y`.
 - github 0.1.1 (fix) - token handling: `GITHUB_API_URL` now applies only to env identities or the identity's own host (ignored with a warning otherwise, so a gh-cli or App token cannot be sent elsewhere); Actions logs are redacted and saved under `~/.cache/apra-github/logs/` (owner-only) instead of `.github-logs/` in the current directory; regression test that the App JWT is redacted as soon as it is minted.
 - github 0.1.0 - first release: a supplement to gh covering identity selection, Discussions + FAQ (replaces the standalone github-discussions-faq skill), PR review mechanics, sub-issues/issue types/duplicates, Actions failure triage; zero-dependency script.
