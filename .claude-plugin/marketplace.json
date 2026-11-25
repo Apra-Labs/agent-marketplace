@@ -68,6 +68,21 @@
         "cli",
         "windows"
       ]
+    },
+    {
+      "name": "password-gen",
+      "source": "./plugins/password-gen",
+      "description": "Strong random passwords the agent never sees: straight to the clipboard (auto-cleared), to your terminal's clipboard over SSH (OSC 52), or piped by you into a secret store. Windows, macOS, Linux. Requires Node.js 18+.",
+      "version": "0.1.0",
+      "category": "security",
+      "keywords": [
+        "password",
+        "generator",
+        "secrets",
+        "clipboard",
+        "ssh",
+        "osc52"
+      ]
     }
   ]
 }
